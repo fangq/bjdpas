@@ -965,6 +965,142 @@ begin
   Check(v.Find('z').AsInt64 = 2, 'the values after it are untouched');
 end;
 
+procedure TestPatch;
+var
+  doc, back: TBJData;
+  buf, before: TBytes;
+  v: TBJValue;
+  i: Integer;
+  d: Double;
+
+  function Json(const ABytes: TBytes): string;
+  var
+    n: TBJData;
+  begin
+    n := TBJData.ParseBytes(ABytes);
+    try
+      Result := n.ToJSON(0);
+    finally
+      n.Free;
+    end;
+  end;
+
+  function Unchanged(const A, B: TBytes): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := Length(A) = Length(B);
+    if Result then
+      for k := 0 to High(A) do
+        if A[k] <> B[k] then
+          Exit(False);
+  end;
+
+begin
+  WriteLn('patching in place');
+
+  doc := TBJData.NewObject;
+  doc.Add('i8', TBJData.NewInt(10, 'i'));
+  doc.Add('u8', TBJData.NewInt(200, 'U'));
+  doc.Add('i32', TBJData.NewInt(70000, 'l'));
+  doc.Add('f64', TBJData.NewFloat(1.5));
+  doc.Add('f32', TBJData.NewFloat(1.5, 'd'));
+  doc.Add('f16', TBJData.NewFloat(1.5, 'h'));
+  doc.Add('flag', TBJData.NewBool(True));
+  doc.Add('text', TBJData.NewString('hello world'));
+  doc.Add('tail', TBJData.NewInt(99));
+  buf := doc.ToBytes([bjwCount]);
+  doc.Free;
+
+  v := TBJData.View(buf);
+  Check(v.Find('i8').TryPatch(Int64(-5)), 'patch an int8');
+  Check(v.Find('u8').TryPatch(Int64(255)), 'patch a uint8');
+  Check(v.Find('i32').TryPatch(Int64(-70000)), 'patch an int32');
+  d := 2.25;
+  Check(v.Find('f64').TryPatch(d), 'patch a float64');
+  Check(v.Find('f32').TryPatch(d), 'patch a float32');
+  Check(v.Find('f16').TryPatch(d), 'patch a float16');
+  Check(v.Find('flag').TryPatch(False), 'patch a boolean');
+  Check(v.Find('text').TryPatchText('hi'), 'patch a shorter string');
+  CheckEq(Json(buf),
+    '{"i8":-5,"u8":255,"i32":-70000,"f64":2.25,"f32":2.25,"f16":2.25,' +
+    '"flag":false,"text":"hi","tail":99}', 'the patched document re-reads');
+  CheckEq(CursorJSON(TBJData.View(buf)), Json(buf),
+    'and the cursor agrees with the tree');
+
+  { a change that does not fit must leave the buffer alone }
+  before := Copy(buf, 0, Length(buf));
+  Check(not v.Find('i8').TryPatch(Int64(1000)), 'an int8 cannot hold 1000');
+  Check(not v.Find('u8').TryPatch(Int64(-1)), 'a uint8 cannot hold -1');
+  Check(not v.Find('text').TryPatchText('a much longer string'),
+    'a longer string is refused');
+  d := 1.5;
+  Check(not v.Find('i8').TryPatch(d), 'a fractional value is refused by an int slot');
+  Check(not v.Find('tail').TryPatchText('x'), 'text cannot be written over a number');
+  Check(Unchanged(before, buf), 'a refused patch leaves every byte as it was');
+
+  { a whole value can be replaced by null, padding what it used to occupy }
+  Check(v.Find('text').TryPatchNull, 'replace a string with null');
+  CheckEq(Json(buf),
+    '{"i8":-5,"u8":255,"i32":-70000,"f64":2.25,"f32":2.25,"f16":2.25,' +
+    '"flag":false,"text":null,"tail":99}', 'the document after nulling');
+
+  { same-size text keeps its length header }
+  doc := TBJData.NewObject;
+  doc.Add('code', TBJData.NewString('AAAA'));
+  doc.Add('n', TBJData.NewInt(1));
+  buf := doc.ToBytes([bjwCount]);
+  doc.Free;
+  v := TBJData.View(buf);
+  Check(v.Find('code').TryPatchText('ZZZZ'), 'patch a string of equal length');
+  CheckEq(Json(buf), '{"code":"ZZZZ","n":1}', 'equal length text patch');
+
+  { elements of an N-d array can be written through a view }
+  doc := TBJData.NewNDArray('D', [2, 3]);
+  buf := doc.ToBytes([bjwCount, bjwType]);
+  doc.Free;
+  v := TBJData.View(buf);
+  d := -7.5;
+  Check(v.Item(v.Offset([1, 1])).TryPatch(d), 'patch one element by subscript');
+  d := 3.25;
+  Check(v.Item(0).TryPatch(d), 'patch one element by position');
+  back := TBJData.ParseBytes(buf);
+  try
+    CheckEq(back.ToJSON(0), '[[3.25,0,0],[0,-7.5,0]]',
+      'the N-d array after patching');
+  finally
+    back.Free;
+  end;
+  Check(not v.Item(0).TryPatchText('x'),
+    'text cannot be written into an N-d array element');
+
+  { patching works the same inside an unbounded container }
+  doc := TBJData.NewObject;
+  doc.Add('text', TBJData.NewString('hello world'));
+  doc.Add('n', TBJData.NewInt(1));
+  buf := doc.ToBytes([]);
+  doc.Free;
+  v := TBJData.View(buf);
+  Check(v.Find('text').TryPatchText('bye'), 'patch inside an unbounded object');
+  CheckEq(Json(buf), '{"text":"bye","n":1}', 'unbounded object after patching');
+
+  { and inside an array, counted or not }
+  for i := 0 to 1 do
+  begin
+    doc := TBJData.NewArray;
+    doc.Add(TBJData.NewString('first value'));
+    doc.Add(TBJData.NewInt(2));
+    if i = 0 then
+      buf := doc.ToBytes([])
+    else
+      buf := doc.ToBytes([bjwCount]);
+    doc.Free;
+    v := TBJData.View(buf);
+    Check(v.Item(0).TryPatchText('x'), Format('patch inside an array (%d)', [i]));
+    CheckEq(Json(buf), '["x",2]', Format('array after patching (%d)', [i]));
+  end;
+end;
+
 procedure TestCursor;
 var
   doc, sub: TBJData;
@@ -1177,6 +1313,7 @@ begin
   TestTruncation;
   TestNoOpPadding;
   TestCursor;
+  TestPatch;
   WriteLn;
   WriteLn(Format('%d test(s), %d failure(s)', [TestCount, FailCount]));
   if FailCount > 0 then

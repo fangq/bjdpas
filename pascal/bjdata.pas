@@ -183,6 +183,13 @@ type
     function ElemAsInt64(AIndex: Int64): Int64;
     function ElemAsDouble(AIndex: Int64): Double;
 
+    {---- editing the buffer in place ----}
+    function TryPatch(AValue: Int64): Boolean; overload;
+    function TryPatch(AValue: Double): Boolean; overload;
+    function TryPatch(AValue: Boolean): Boolean; overload;
+    function TryPatchText(const AText: string): Boolean;
+    function TryPatchNull: Boolean;
+
     {---- the value as a whole ----}
     function Size: PtrUInt;
     function ToData(AOptions: TBJDataParseOptions = []): TBJData;
@@ -5364,6 +5371,188 @@ end;
 function TBJValue.ElemAsDouble(AIndex: Int64): Double;
 begin
   Result := Item(AIndex).AsDouble;
+end;
+
+{==============================================================================
+  Editing in place
+
+  A value can be overwritten where it lies as long as the replacement is no
+  longer than the original. Same-width numbers always fit; shorter text is
+  written over longer text and the bytes it frees are filled with no-op
+  markers, which a decoder skips. Nothing is written unless the whole change
+  fits, so a failed attempt leaves the buffer exactly as it was.
+==============================================================================}
+
+procedure BJPokeInt(APtr: PByte; AMarker: AnsiChar; AValue: Int64);
+var
+  v16: Word;
+  v32: LongWord;
+  v64: Int64;
+begin
+  case BJMarkerSize(AMarker) of
+    1:
+      APtr^ := Byte(AValue);
+    2:
+      begin
+        v16 := Word(AValue);
+        BJFromLE(@v16, 2, 1);
+        Move(v16, APtr^, 2);
+      end;
+    4:
+      begin
+        v32 := LongWord(AValue);
+        BJFromLE(@v32, 4, 1);
+        Move(v32, APtr^, 4);
+      end;
+    8:
+      begin
+        v64 := AValue;
+        BJFromLE(@v64, 8, 1);
+        Move(v64, APtr^, 8);
+      end;
+  end;
+end;
+
+function BJIntFits(AValue: Int64; AMarker: AnsiChar): Boolean;
+begin
+  case AMarker of
+    bjmInt8:   Result := (AValue >= -128) and (AValue <= 127);
+    bjmUInt8, bjmByte:
+               Result := (AValue >= 0) and (AValue <= 255);
+    bjmChar:   Result := (AValue >= 0) and (AValue <= 127);
+    bjmInt16:  Result := (AValue >= -32768) and (AValue <= 32767);
+    bjmUInt16: Result := (AValue >= 0) and (AValue <= 65535);
+    bjmInt32:  Result := (AValue >= -2147483648) and (AValue <= 2147483647);
+    bjmUInt32: Result := (AValue >= 0) and (AValue <= 4294967295);
+    bjmInt64:  Result := True;
+    bjmUInt64: Result := AValue >= 0;
+  else
+    Result := False;
+  end;
+end;
+
+function TBJValue.TryPatch(AValue: Int64): Boolean;
+var
+  m: AnsiChar;
+begin
+  Result := False;
+  if not IsValid then
+    Exit;
+  m := Marker;
+  if BJIsFloatMarker(m) then
+    Exit(TryPatch(Double(AValue)));
+  if not BJIntFits(AValue, m) then
+    Exit;
+  if PayloadPtr + BJMarkerSize(m) > FEnd then
+    Exit;
+  BJPokeInt(PayloadPtr, m, AValue);
+  Result := True;
+end;
+
+function TBJValue.TryPatch(AValue: Double): Boolean;
+var
+  m: AnsiChar;
+  p: PByte;
+  w: Word;
+  f: Single;
+  d: Double;
+begin
+  Result := False;
+  if not IsValid then
+    Exit;
+  m := Marker;
+  p := PayloadPtr;
+  if p + BJMarkerSize(m) > FEnd then
+    Exit;
+  case m of
+    bjmFloat16:
+      begin
+        w := BJDoubleToHalf(AValue);
+        BJFromLE(@w, 2, 1);
+        Move(w, p^, 2);
+      end;
+    bjmFloat32:
+      begin
+        f := AValue;
+        BJFromLE(@f, 4, 1);
+        Move(f, p^, 4);
+      end;
+    bjmFloat64:
+      begin
+        d := AValue;
+        BJFromLE(@d, 8, 1);
+        Move(d, p^, 8);
+      end;
+  else
+    { an integer slot only takes a value that is exactly an integer }
+    if (Frac(AValue) <> 0) or (Abs(AValue) > 9.2e18) then
+      Exit;
+    Exit(TryPatch(Round(AValue)));
+  end;
+  Result := True;
+end;
+
+function TBJValue.TryPatch(AValue: Boolean): Boolean;
+begin
+  { the marker of a boolean is its value, so this is a one byte change }
+  Result := False;
+  if not IsValid or (FImplied <> #0) then
+    Exit;
+  if not (AnsiChar(FPos^) in [bjmTrue, bjmFalse]) then
+    Exit;
+  if AValue then
+    FPos^ := Byte(bjmTrue)
+  else
+    FPos^ := Byte(bjmFalse);
+  Result := True;
+end;
+
+function TBJValue.TryPatchText(const AText: string): Boolean;
+var
+  m, lenmark: AnsiChar;
+  total, room: Int64;
+  hdr: Integer;
+  body: PByte;
+begin
+  Result := False;
+  { a value inside a typed container has no marker of its own, so there is
+    nowhere to put the padding that a shorter string would free }
+  if not IsValid or (FImplied <> #0) then
+    Exit;
+  m := AnsiChar(FPos^);
+  if (m <> bjmString) and (m <> bjmHighPrec) then
+    Exit;
+  lenmark := AnsiChar((FPos + 1)^);
+  if not BJIsIntMarker(lenmark) then
+    Exit;
+  hdr := 2 + BJMarkerSize(lenmark);            { marker, length marker, length }
+  total := Size;
+  room := total - hdr;
+  if (Length(AText) > room) or not BJIntFits(Length(AText), lenmark) then
+    Exit;
+  BJPokeInt(FPos + 2, lenmark, Length(AText));
+  body := FPos + hdr;
+  if Length(AText) > 0 then
+    Move(AText[1], body^, Length(AText));
+  if room > Length(AText) then
+    FillChar((body + Length(AText))^, room - Length(AText), Byte(bjmNoOp));
+  Result := True;
+end;
+
+function TBJValue.TryPatchNull: Boolean;
+var
+  total: Int64;
+begin
+  Result := False;
+  if not IsValid or (FImplied <> #0) then
+    Exit;
+  total := Size;
+  if total < 1 then
+    Exit;
+  FPos^ := Byte(bjmNull);
+  if total > 1 then
+    FillChar((FPos + 1)^, total - 1, Byte(bjmNoOp));
+  Result := True;
 end;
 
 function TBJValue.ToData(AOptions: TBJDataParseOptions): TBJData;

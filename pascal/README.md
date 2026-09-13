@@ -95,6 +95,36 @@ to patching:
   everything after it has to move. Rebuild that part of the document instead:
   `ToData` the subtree, change it, and write it back out.
 
+`TBJValue` does the bookkeeping:
+
+```pascal
+v := TBJData.View(buf);
+v.Find('threshold').TryPatch(0.35);              // same width, always fits
+v.Find('label').TryPatchText('ok');              // shorter, rest padded
+v.Find('scratch').TryPatchNull;                  // drop a value entirely
+vol.Item(vol.Offset([12, 7, 3])).TryPatch(9.5);  // one element of an N-d array
+
+if not v.Find('count').TryPatch(70000) then      // an int8 cannot hold it
+  ReplaceTheWholeDocument;
+```
+
+| | accepted |
+|---|---|
+| `TryPatch(Int64)` | any integer slot wide enough for the value; a float slot |
+| `TryPatch(Double)` | any float slot; an integer slot if the value is a whole number that fits |
+| `TryPatch(Boolean)` | `T` / `F`, whose marker is the value |
+| `TryPatchText` | `S` and `H`, when the text fits what the old one occupied and the existing length header can express it |
+| `TryPatchNull` | any value with its own marker; the rest of its bytes become no-ops |
+
+Each returns False rather than writing anything partial, so a refused patch
+leaves every byte as it was. Two things they will not do: write into a value
+inside an `[$type#...]` container, which has no marker of its own and so no
+room for padding (numbers there can still be patched at the same width), and
+grow a value.
+
+The buffer is written through the pointer the view holds, so it must be
+writable, and a `TBytes` shared with something else changes for that too.
+
 Two limits worth knowing: a structure-of-arrays record cannot be browsed field
 by field (the cursor reports `IsSoA` and `ToData` materialises it), and
 `DataPtr` hands back the little-endian bytes of the file, so on a big-endian
@@ -307,7 +337,7 @@ build/bench -l -k type actor.id big.bjd   # compare the cursor against the tree
 make cross       # additionally cross-check against the python bjdata module
 ```
 
-`test/bjdtest.lpr` holds 168 checks covering the examples of the specification,
+`test/bjdtest.lpr` holds 198 checks covering the examples of the specification,
 round-trips and error handling, including a sweep that parses every prefix and
 every single-byte corruption of a document to confirm that malformed input is
 rejected without crashing or leaking (run the suite with `-gh` to verify the
