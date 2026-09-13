@@ -1,0 +1,13 @@
+*.o
+*.ppu
+*.compiled
+*.bak
+*.or
+*.res
+*.lps
+backup/
+lib/
+build/
+pascal/test/bjdtest
+pascal/tools/bjd2json
+pascal/bjdatapkg.pas

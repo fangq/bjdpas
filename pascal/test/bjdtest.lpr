@@ -1,0 +1,693 @@
+program bjdtest;
+
+{  regression tests for the bjdata unit; every case is checked against the
+   examples given in the Binary JData specification (Draft 4) or against a
+   round-trip through the encoder and the decoder.                          }
+
+{$mode objfpc}{$H+}
+
+uses
+  SysUtils, Classes, Math, bjdata;
+
+var
+  TestCount: Integer = 0;
+  FailCount: Integer = 0;
+
+procedure Check(ACondition: Boolean; const AName: string);
+begin
+  Inc(TestCount);
+  Flush(Output);
+  if ACondition then
+    WriteLn('  ok   ', AName)
+  else
+  begin
+    Inc(FailCount);
+    WriteLn('  FAIL ', AName);
+  end;
+end;
+
+procedure CheckEq(const AGot, AWant, AName: string);
+begin
+  Inc(TestCount);
+  Flush(Output);
+  if AGot = AWant then
+    WriteLn('  ok   ', AName)
+  else
+  begin
+    Inc(FailCount);
+    WriteLn('  FAIL ', AName);
+    WriteLn('       want: ', AWant);
+    WriteLn('       got:  ', AGot);
+  end;
+end;
+
+// a tiny helper used to hand-assemble the binary examples of the spec
+type
+  TBuf = class(TMemoryStream)
+  public
+    procedure Hex(const AHex: string);
+    procedure Txt(const AText: string);
+    procedure U8(AValue: Byte);
+    procedure U32(AValue: LongWord);
+    procedure F64(AValue: Double);
+    function Bytes: TBytes;
+  end;
+
+procedure TBuf.Hex(const AHex: string);
+var
+  i: Integer;
+  b: Byte;
+  s: string;
+begin
+  s := StringReplace(AHex, ' ', '', [rfReplaceAll]);
+  i := 1;
+  while i < Length(s) do
+  begin
+    b := StrToInt('$' + Copy(s, i, 2));
+    WriteBuffer(b, 1);
+    Inc(i, 2);
+  end;
+end;
+
+procedure TBuf.Txt(const AText: string);
+begin
+  if AText <> '' then
+    WriteBuffer(AText[1], Length(AText));
+end;
+
+procedure TBuf.U8(AValue: Byte);
+begin
+  WriteBuffer(AValue, 1);
+end;
+
+procedure TBuf.U32(AValue: LongWord);
+begin
+  WriteBuffer(AValue, 4);
+end;
+
+procedure TBuf.F64(AValue: Double);
+begin
+  WriteBuffer(AValue, 8);
+end;
+
+function TBuf.Bytes: TBytes;
+begin
+  Result := nil;
+  SetLength(Result, Size);
+  if Size > 0 then
+    Move(Memory^, Result[0], Size);
+end;
+
+function ParseHex(const AHex: string; AOptions: TBJDataParseOptions = []): TBJData;
+var
+  b: TBuf;
+begin
+  b := TBuf.Create;
+  try
+    b.Hex(AHex);
+    Result := TBJData.ParseBytes(b.Bytes, AOptions);
+  finally
+    b.Free;
+  end;
+end;
+
+function MkBytes(const AValues: array of Byte): TBytes;
+var
+  i: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(AValues));
+  for i := 0 to High(AValues) do
+    Result[i] := AValues[i];
+end;
+
+function HexOf(const ABuf: TBytes): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(ABuf) do
+    Result := Result + IntToHex(ABuf[i], 2);
+end;
+
+// round-trip a document through the encoder and decoder and return the JSON
+function RoundTrip(ANode: TBJData; AOptions: TBJDataWriteOptions): string;
+var
+  back: TBJData;
+begin
+  back := TBJData.ParseBytes(ANode.ToBytes(AOptions));
+  try
+    Result := back.ToJSON(0);
+  finally
+    back.Free;
+  end;
+end;
+
+{------------------------------------------------------------------------------}
+
+procedure TestScalars;
+var
+  d: TBJData;
+begin
+  WriteLn('scalar values');
+
+  d := ParseHex('5A');                            // Z
+  CheckEq(d.ToJSON(0), 'null', 'null marker');
+  d.Free;
+
+  d := ParseHex('54');                            // T
+  CheckEq(d.ToJSON(0), 'true', 'true marker');
+  d.Free;
+
+  d := ParseHex('46');                            // F
+  CheckEq(d.ToJSON(0), 'false', 'false marker');
+  d.Free;
+
+  d := ParseHex('6910');                          // i 16
+  CheckEq(d.ToJSON(0), '16', 'int8');
+  d.Free;
+
+  d := ParseHex('69F0');                          // i -16
+  CheckEq(d.ToJSON(0), '-16', 'negative int8');
+  d.Free;
+
+  d := ParseHex('55FF');                          // U 255
+  CheckEq(d.ToJSON(0), '255', 'uint8');
+  d.Free;
+
+  d := ParseHex('49FF7F');                        // I 32767, little-endian
+  CheckEq(d.ToJSON(0), '32767', 'int16 is little-endian');
+  d.Free;
+
+  d := ParseHex('750080');                        // u 32768
+  CheckEq(d.ToJSON(0), '32768', 'uint16');
+  d.Free;
+
+  d := ParseHex('6CFFFFFF7F');                    // l 2147483647
+  CheckEq(d.ToJSON(0), '2147483647', 'int32');
+  d.Free;
+
+  d := ParseHex('4CFFFFFFFFFFFFFF7F');            // L int64 max
+  CheckEq(d.ToJSON(0), '9223372036854775807', 'int64');
+  d.Free;
+
+  d := ParseHex('4D0000000000000080');            // M 2^63
+  CheckEq(d.ToJSON(0), '9223372036854775808', 'uint64 beyond int64 range');
+  d.Free;
+
+  d := ParseHex('6400004040');                    // d 3.0
+  CheckEq(d.ToJSON(0), '3', 'float32');
+  d.Free;
+
+  d := ParseHex('44000000000000F03F');            // D 1.0
+  CheckEq(d.ToJSON(0), '1', 'float64');
+  d.Free;
+
+  d := ParseHex('680042');                        // h 3.0
+  CheckEq(d.ToJSON(0), '3', 'float16');
+  d.Free;
+
+  d := ParseHex('4361');                          // C 'a'
+  CheckEq(d.ToJSON(0), '"a"', 'char');
+  d.Free;
+
+  d := ParseHex('427B');                          // B 123
+  CheckEq(d.ToJSON(0), '123', 'byte');
+  d.Free;
+
+  d := ParseHex('536904616E6479');                // S i 4 andy
+  CheckEq(d.ToJSON(0), '"andy"', 'string');
+  d.Free;
+
+  d := ParseHex('48690A2D312E3933452B313930');    // H i 10 -1.93E+190
+  CheckEq(d.ToJSON(0), '-1.93E+190', 'high-precision number');
+  d.Free;
+
+  // NaN and infinity use their IEEE-754 form, unlike in UBJSON
+  d := TBJData.NewFloat(NaN);
+  CheckEq(RoundTrip(d, [bjwCount, bjwType]), '"_NaN_"', 'NaN round-trip');
+  d.Free;
+  d := TBJData.NewFloat(Infinity);
+  CheckEq(RoundTrip(d, [bjwCount, bjwType]), '"_Inf_"', 'infinity round-trip');
+  d.Free;
+end;
+
+procedure TestContainers;
+var
+  d: TBJData;
+begin
+  WriteLn('containers');
+
+  // {i8passcodeZ}
+  d := ParseHex('7B' + '6908' + '70617373636F6465' + '5A' + '7D');
+  CheckEq(d.ToJSON(0), '{"passcode":null}', 'object with a null value');
+  d.Free;
+
+  // unoptimized array: [ Z T F l 4782345193... ]
+  d := ParseHex('5B' + '5A' + '54' + '46' + '5D');
+  CheckEq(d.ToJSON(0), '[null,true,false]', 'unoptimized array');
+  d.Free;
+
+  // count-optimized array: [#i3 i1 i2 i3
+  d := ParseHex('5B2369036901690269 03');
+  CheckEq(d.ToJSON(0), '[1,2,3]', 'count-optimized array');
+  d.Free;
+
+  // type+count optimized: [$i#i3
+  d := ParseHex('5B246923690301 0203');
+  CheckEq(d.ToJSON(0), '[1,2,3]', 'type-optimized array');
+  d.Free;
+
+  // count-optimized object: {#i2
+  d := ParseHex('7B2369026901616905' + '690162' + '6906');
+  CheckEq(d.ToJSON(0), '{"a":5,"b":6}', 'count-optimized object');
+  d.Free;
+
+  // type+count optimized object: {$i#i2
+  d := ParseHex('7B24692369026901 6105 690162 06');
+  CheckEq(d.ToJSON(0), '{"a":5,"b":6}', 'type-optimized object');
+  d.Free;
+
+  // the byte array of the spec: [$B#i4 222 173 190 239
+  d := ParseHex('5B2442236904DEADBEEF');
+  CheckEq(d.ToJSON(0), '[222,173,190,239]', 'packed byte array');
+  Check(d.Kind = bjkTypedArray, 'packed byte array kind');
+  Check(Length(d.AsBytes) = 4, 'packed byte array payload');
+  d.Free;
+
+  // no-op markers are skipped
+  d := ParseHex('5B' + '4E' + '6901' + '4E' + '6902' + '5D');
+  CheckEq(d.ToJSON(0), '[1,2]', 'no-op markers are skipped');
+  d.Free;
+
+  // empty containers
+  d := ParseHex('5B5D');
+  CheckEq(d.ToJSON(0), '[]', 'empty array');
+  d.Free;
+  d := ParseHex('7B7D');
+  CheckEq(d.ToJSON(0), '{}', 'empty object');
+  d.Free;
+end;
+
+procedure TestNDArray;
+const
+  RowData = '01090600 02090301 08000906 06040207 08050102 03030206';
+  ColData = '01060208 08030904 09050003 06020301 09020007 01020606';
+  Expect  = '[[[1,9,6,0],[2,9,3,1],[8,0,9,6]],[[6,4,2,7],[8,5,1,2],[3,3,2,6]]]';
+var
+  d, e: TBJData;
+begin
+  WriteLn('N-dimensional packed arrays');
+
+  // [$U#[$U#i3 2 3 4] : row-major 2x3x4 uint8 array
+  d := ParseHex('5B2455235B2455236903020304' + RowData);
+  Check(d.Kind = bjkTypedArray, 'row-major packed array kind');
+  Check((d.DimCount = 3) and (d.Dim[0] = 2) and (d.Dim[1] = 3) and (d.Dim[2] = 4),
+    'row-major dimensions');
+  Check(not d.ColumnMajor, 'row-major flag');
+  CheckEq(d.ToJSON(0), Expect, 'row-major payload');
+  CheckEq(RoundTrip(d, [bjwCount, bjwType]), Expect, 'row-major round-trip');
+  d.Free;
+
+  // the same array written with an unoptimized dimension vector
+  d := ParseHex('5B2455235B5502550355045D' + RowData);
+  CheckEq(d.ToJSON(0), Expect, 'unoptimized dimension vector');
+  d.Free;
+
+  // and with a count-optimized dimension vector
+  d := ParseHex('5B2455235B2369035502550355 04' + RowData);
+  CheckEq(d.ToJSON(0), Expect, 'count-optimized dimension vector');
+  d.Free;
+
+  // [$U#[[$U#i3 2 3 4]] : column-major
+  d := ParseHex('5B2455235B5B2455236903020304' + '5D' + ColData);
+  Check(d.ColumnMajor, 'column-major flag');
+  CheckEq(d.ToJSON(0), Expect, 'column-major payload maps to the same array');
+  CheckEq(RoundTrip(d, [bjwCount, bjwType]), Expect, 'column-major round-trip');
+  d.Free;
+
+  // expansion into a plain nested array
+  d := ParseHex('5B2455235B2455236903020304' + RowData, [bjpExpandTypedArray]);
+  Check(d.Kind = bjkArray, 'expanded array kind');
+  CheckEq(d.ToJSON(0), Expect, 'expanded array content');
+  d.Free;
+
+  // a float64 3x2 array built through the API
+  e := TBJData.NewTypedArray('D', [3, 2]);
+  e.SetElem(0, 1.5);
+  e.SetElem(5, -2.25);
+  CheckEq(e.ToJSON(0), '[[1.5,0],[0,0],[0,-2.25]]', 'API-built packed array');
+  CheckEq(RoundTrip(e, [bjwCount, bjwType]), '[[1.5,0],[0,0],[0,-2.25]]',
+    'API-built packed array round-trip');
+  e.Free;
+end;
+
+procedure TestExtensions;
+var
+  d: TBJData;
+  re, im: Double;
+begin
+  WriteLn('extension types');
+
+  // E U 8 U 8 <3.0f, 4.0f>
+  d := ParseHex('45550855080000404000008040');
+  Check(d.Kind = bjkExtension, 'extension kind');
+  Check(d.ExtTypeId = 8, 'complex64 type id');
+  Check(d.AsComplex(re, im) and (re = 3.0) and (im = 4.0), 'complex64 value');
+  // the encoder picks the smallest marker for the type id and the length,
+  // so int8 is used where the spec example shows uint8; both are valid
+  CheckEq(HexOf(d.ToBytes([])), '45690869080000404000008040',
+    'complex64 byte-exact round-trip');
+  d.Free;
+
+  // E U 10 U 16 550e8400-e29b-41d4-a716-446655440000
+  d := ParseHex('4555' + '0A' + '5510' + '550e8400e29b41d4a716446655440000');
+  CheckEq(d.AsUUIDString, '550e8400-e29b-41d4-a716-446655440000', 'uuid value');
+  d.Free;
+
+  d := TBJData.NewComplex(1.25, -0.5);
+  Check(d.ExtTypeId = 9, 'complex128 type id');
+  Check(d.AsComplex(re, im) and (re = 1.25) and (im = -0.5), 'complex128 value');
+  d.Free;
+
+  d := TBJData.NewUUID('{550E8400-E29B-41D4-A716-446655440000}');
+  CheckEq(d.AsUUIDString, '550e8400-e29b-41d4-a716-446655440000',
+    'uuid built from a braced string');
+  d.Free;
+
+  d := TBJData.NewDateTime(EncodeDate(2024, 1, 15) + EncodeTime(10, 30, 0, 0));
+  Check(Abs(d.AsDateTime - (EncodeDate(2024, 1, 15) + EncodeTime(10, 30, 0, 0)))
+    < 1.0e-9, 'datetime round-trip');
+  d.Free;
+end;
+
+procedure TestSoARead;
+var
+  b: TBuf;
+  d: TBJData;
+begin
+  WriteLn('structure-of-arrays decoding');
+
+  // Example 1 of the spec: 2 records of {id:uint32, pos:{x,y}, val:[3xD], on:T}
+  b := TBuf.Create;
+  try
+    b.Hex('5B247B');                    // [ $ {
+    b.Hex('6902'); b.Txt('id');   b.Hex('6D');
+    b.Hex('6903'); b.Txt('pos');  b.Hex('7B');
+      b.Hex('6901'); b.Txt('x'); b.Hex('44');
+      b.Hex('6901'); b.Txt('y'); b.Hex('44');
+    b.Hex('7D');
+    b.Hex('6903'); b.Txt('val');  b.Hex('5B444444 5D');
+    b.Hex('6902'); b.Txt('on');   b.Hex('54');
+    b.Hex('7D');                        // end of schema
+    b.Hex('23 6902');                   // # i 2
+    b.U32(1); b.F64(1.0); b.F64(2.0); b.F64(0.1); b.F64(0.2); b.F64(0.3); b.U8(Ord('T'));
+    b.U32(2); b.F64(3.0); b.F64(4.0); b.F64(0.4); b.F64(0.5); b.F64(0.6); b.U8(Ord('F'));
+    d := TBJData.ParseBytes(b.Bytes);
+  finally
+    b.Free;
+  end;
+  CheckEq(d.ToJSON(0),
+    '[{"id":1,"pos":{"x":1,"y":2},"val":[0.1,0.2,0.3],"on":true},' +
+    '{"id":2,"pos":{"x":3,"y":4},"val":[0.4,0.5,0.6],"on":false}]',
+    'row-major SoA with nested object and array columns');
+  Check(d.FromSoA, 'SoA origin flag');
+  CheckEq(RoundTrip(d, [bjwCount, bjwType, bjwSoA]),
+    '[{"id":1,"pos":{"x":1,"y":2},"val":[0.1,0.2,0.3],"on":true},' +
+    '{"id":2,"pos":{"x":3,"y":4},"val":[0.4,0.5,0.6],"on":false}]',
+    'row-major SoA re-encoded as SoA');
+  d.Free;
+
+  // Example 2 of the spec: dictionary, offset table and fixed-width strings
+  b := TBuf.Create;
+  try
+    b.Hex('5B247B');
+    b.Hex('6902'); b.Txt('id');     b.Hex('6D');
+    b.Hex('6906'); b.Txt('status'); b.Hex('5B24532369 03');
+      b.Hex('6906'); b.Txt('active');
+      b.Hex('6908'); b.Txt('inactive');
+      b.Hex('6907'); b.Txt('pending');
+    b.Hex('6904'); b.Txt('name');   b.Hex('5B246C5D');   // [$l]
+    b.Hex('6904'); b.Txt('code');   b.Hex('536904');     // S i 4
+    b.Hex('7D');
+    b.Hex('236903');                                     // # i 3
+    b.U32(1); b.U8(0); b.U32(0); b.Txt('U001');
+    b.U32(2); b.U8(2); b.U32(1); b.Txt('U002');
+    b.U32(3); b.U8(0); b.U32(2); b.Txt('U003');
+    b.U32(0); b.U32(5); b.U32(8); b.U32(32);             // offset table
+    b.Txt('AliceBobDr. Christopher Williams');
+    d := TBJData.ParseBytes(b.Bytes);
+  finally
+    b.Free;
+  end;
+  CheckEq(d.ToJSON(0),
+    '[{"id":1,"status":"active","name":"Alice","code":"U001"},' +
+    '{"id":2,"status":"pending","name":"Bob","code":"U002"},' +
+    '{"id":3,"status":"active","name":"Dr. Christopher Williams","code":"U003"}]',
+    'row-major SoA with dictionary and offset-table strings');
+  d.Free;
+
+  // the same three records stored column-major
+  b := TBuf.Create;
+  try
+    b.Hex('7B247B');                                     // { $ {
+    b.Hex('6901'); b.Txt('x'); b.Hex('44');
+    b.Hex('6901'); b.Txt('n'); b.Hex('54');
+    b.Hex('7D');
+    b.Hex('236903');
+    b.F64(1.0); b.F64(2.0); b.F64(3.0);
+    b.U8(Ord('T')); b.U8(Ord('F')); b.U8(Ord('T'));
+    d := TBJData.ParseBytes(b.Bytes);
+  finally
+    b.Free;
+  end;
+  CheckEq(d.ToJSON(0),
+    '[{"x":1,"n":true},{"x":2,"n":false},{"x":3,"n":true}]',
+    'column-major SoA decoded as an array of records');
+  Check(d.ColumnMajor, 'column-major SoA flag');
+  CheckEq(RoundTrip(d, [bjwCount, bjwType, bjwSoA]),
+    '[{"x":1,"n":true},{"x":2,"n":false},{"x":3,"n":true}]',
+    'column-major SoA re-encoded in the same layout');
+  d.Free;
+
+  // and decoded as an object of columns when asked for
+  b := TBuf.Create;
+  try
+    b.Hex('7B247B');
+    b.Hex('6901'); b.Txt('x'); b.Hex('44');
+    b.Hex('6901'); b.Txt('n'); b.Hex('54');
+    b.Hex('7D');
+    b.Hex('236903');
+    b.F64(1.0); b.F64(2.0); b.F64(3.0);
+    b.U8(Ord('T')); b.U8(Ord('F')); b.U8(Ord('T'));
+    d := TBJData.ParseBytes(b.Bytes, [bjpSoAAsColumns]);
+  finally
+    b.Free;
+  end;
+  CheckEq(d.ToJSON(0), '{"x":[1,2,3],"n":[true,false,true]}',
+    'column-major SoA decoded as an object of columns');
+  Check(d.FromSoA, 'object of columns keeps the SoA flag');
+  CheckEq(RoundTrip(d, [bjwCount, bjwType, bjwSoA]),
+    '[{"x":1,"n":true},{"x":2,"n":false},{"x":3,"n":true}]',
+    'object of columns re-encoded as a column-major SoA record');
+  // without the SoA flag a plain object of arrays must stay an object
+  d.FromSoA := False;
+  CheckEq(RoundTrip(d, [bjwCount, bjwType, bjwSoA]),
+    '{"x":[1,2,3],"n":[true,false,true]}',
+    'a plain object of arrays is never turned into an SoA record');
+  d.Free;
+end;
+
+procedure TestSoAWrite;
+var
+  arr, rec, back: TBJData;
+  i: Integer;
+  bin: TBytes;
+const
+  Names: array[0..3] of string = ('Alice', 'Bob', 'Dr. Christopher Williams', 'Eve');
+  Status: array[0..3] of string = ('active', 'pending', 'active', 'active');
+begin
+  WriteLn('structure-of-arrays encoding');
+
+  arr := TBJData.NewArray;
+  for i := 0 to 3 do
+  begin
+    rec := arr.Add(TBJData.NewObject);
+    rec.Add('id', TBJData.NewInt(i + 1));
+    rec.Add('status', TBJData.NewString(Status[i]));
+    rec.Add('name', TBJData.NewString(Names[i]));
+    rec.Add('score', TBJData.NewFloat(1.5 * i));
+    rec.Add('ok', TBJData.NewBool(Odd(i)));
+  end;
+
+  bin := arr.ToBytes([bjwCount, bjwType, bjwSoA]);
+  Check(Length(bin) > 0, 'SoA encoding produced output');
+  Check((bin[0] = Ord('[')) and (bin[1] = Ord('$')) and (bin[2] = Ord('{')),
+    'SoA encoding starts with a row-major schema header');
+
+  back := TBJData.ParseBytes(bin);
+  try
+    CheckEq(back.ToJSON(0), arr.ToJSON(0), 'SoA encode/decode round-trip');
+  finally
+    back.Free;
+  end;
+
+  // the same table stored column-major
+  bin := arr.ToBytes([bjwCount, bjwType, bjwSoA, bjwColumnMajor]);
+  Check(bin[0] = Ord('{'), 'column-major SoA header');
+  back := TBJData.ParseBytes(bin);
+  try
+    CheckEq(back.ToJSON(0), arr.ToJSON(0), 'column-major SoA round-trip');
+  finally
+    back.Free;
+  end;
+
+  // SoA is smaller than the generic object encoding for this table
+  Check(Length(arr.ToBytes([bjwCount, bjwType, bjwSoA])) <
+        Length(arr.ToBytes([bjwCount, bjwType])), 'SoA encoding is more compact');
+
+  // a table that cannot be packed falls back to the generic encoding
+  arr.Items[2].Values['score'] := TBJData.NewObject;
+  bin := arr.ToBytes([bjwCount, bjwType, bjwSoA]);
+  Check(bin[1] <> Ord('$'), 'non-uniform table falls back to a plain array');
+  back := TBJData.ParseBytes(bin);
+  try
+    CheckEq(back.ToJSON(0), arr.ToJSON(0), 'fallback round-trip');
+  finally
+    back.Free;
+  end;
+  arr.Free;
+end;
+
+procedure TestRoundTrip;
+var
+  doc, sub: TBJData;
+  json: string;
+begin
+  WriteLn('document round-trips');
+
+  doc := TBJData.NewObject;
+  doc.Add('nil', TBJData.NewNull);
+  doc.Add('yes', TBJData.NewBool(True));
+  doc.Add('i8', TBJData.NewInt(-7));
+  doc.Add('u64', TBJData.NewUInt(High(QWord)));
+  doc.Add('pi', TBJData.NewFloat(3.141592653589793));
+  doc.Add('half', TBJData.NewFloat(0.5, 'h'));
+  doc.Add('text', TBJData.NewString('hello, 世界'));
+  doc.Add('ch', TBJData.NewChar(';'));
+  doc.Add('huge', TBJData.NewHighPrec('3.14159265358979323846'));
+  doc.Add('bin', TBJData.NewBytes(MkBytes([1, 2, 3, 250])));
+  sub := doc.Add('list', TBJData.NewArray);
+  sub.Add(TBJData.NewInt(1));
+  sub.Add(TBJData.NewString('two'));
+  sub.Add(TBJData.NewArray);
+  doc.Add('grid', TBJData.NewTypedArray('l', [2, 2]));
+  doc.Values['grid'].SetElem(3, Int64(70000));
+
+  json := doc.ToJSON(0);
+  CheckEq(RoundTrip(doc, [bjwCount, bjwType]), json, 'full document, optimized');
+  CheckEq(RoundTrip(doc, [bjwCount]), json, 'full document, count only');
+  CheckEq(RoundTrip(doc, []), json, 'full document, unoptimized');
+  CheckEq(RoundTrip(doc, [bjwCount, bjwType, bjwSoA]), json,
+    'full document, SoA enabled');
+
+  Check(doc.Path('list[1]') <> nil, 'path lookup finds an array element');
+  CheckEq(doc.Path('list[1]').AsString, 'two', 'path lookup value');
+  Check(doc.Path('grid') <> nil, 'path lookup finds a packed array');
+  Check(doc.Path('nope.deeper') = nil, 'path lookup of a missing key');
+
+  sub := doc.Clone;
+  CheckEq(sub.ToJSON(0), json, 'clone equality');
+  sub.Free;
+
+  doc.Free;
+end;
+
+procedure TestEdgeCases;
+var
+  d: TBJData;
+  ok: Boolean;
+  i: Integer;
+  v: Double;
+begin
+  WriteLn('edge cases');
+
+  // truncated input must raise rather than read past the buffer
+  ok := False;
+  try
+    d := ParseHex('5B240923');
+    d.Free;
+  except
+    on E: EBJData do
+      ok := True;
+  end;
+  Check(ok, 'a truncated stream raises EBJData');
+
+  ok := False;
+  try
+    d := ParseHex('536905616263');                // S i 5 abc
+    d.Free;
+  except
+    on E: EBJData do
+      ok := True;
+  end;
+  Check(ok, 'a short string payload raises EBJData');
+
+  ok := False;
+  try
+    d := ParseHex('51');                          // unknown marker
+    d.Free;
+  except
+    on E: EBJData do
+      ok := True;
+  end;
+  Check(ok, 'an unknown marker raises EBJData');
+
+  // half-precision round-trip over a range of values
+  ok := True;
+  for i := -2048 to 2048 do
+  begin
+    v := i / 16.0;
+    if BJHalfToDouble(BJDoubleToHalf(v)) <> v then
+      ok := False;
+  end;
+  Check(ok, 'float16 round-trips exactly for representable values');
+  Check(BJHalfToDouble($7C00) = Infinity, 'float16 infinity');
+  Check(IsNan(BJHalfToDouble($7E00)), 'float16 NaN');
+  Check(BJDoubleToHalf(1.0) = $3C00, 'float16 encoding of 1.0');
+  Check(BJDoubleToHalf(-2.0) = $C000, 'float16 encoding of -2.0');
+
+  // the smallest integer type is selected when writing
+  d := TBJData.NewInt(200);
+  CheckEq(HexOf(d.ToBytes([])), '55C8', 'a value of 200 is stored as uint8');
+  d.Free;
+  d := TBJData.NewInt(-200);
+  CheckEq(HexOf(d.ToBytes([])), '4938FF', 'a value of -200 is stored as int16');
+  d.Free;
+
+  // a uniform array of small integers becomes a packed array
+  d := TBJData.NewArray;
+  d.Add(TBJData.NewInt(1));
+  d.Add(TBJData.NewInt(2));
+  d.Add(TBJData.NewInt(300));
+  CheckEq(HexOf(d.ToBytes([bjwCount, bjwType])), '5B2449236903010002002C01',
+    'mixed-width integers share the smallest common type');
+  d.Free;
+end;
+
+begin
+  WriteLn('bjdata.pas ', BJDataVersion, ' test suite');
+  WriteLn;
+  TestScalars;
+  TestContainers;
+  TestNDArray;
+  TestExtensions;
+  TestSoARead;
+  TestSoAWrite;
+  TestRoundTrip;
+  TestEdgeCases;
+  WriteLn;
+  WriteLn(Format('%d test(s), %d failure(s)', [TestCount, FailCount]));
+  if FailCount > 0 then
+    Halt(1);
+end.

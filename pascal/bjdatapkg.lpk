@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Lazarus package for bjdata.pas.  The package is deliberately *not* named
+     "bjdata": Lazarus generates and overwrites <packagename>.pas, which would
+     destroy the unit.  Installing this package puts bjdata.pas on the unit
+     path of every project; alternatively just add bjdata.pas to a project. -->
+<CONFIG>
+  <Package Version="5">
+    <PathDelim Value="/"/>
+    <Name Value="bjdatapkg"/>
+    <Author Value="Qianqian Fang"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <PathDelim Value="/"/>
+      <SearchPaths>
+        <UnitOutputDirectory Value="lib/$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+      <Parsing>
+        <SyntaxOptions>
+          <UseAnsiStrings Value="True"/>
+        </SyntaxOptions>
+      </Parsing>
+    </CompilerOptions>
+    <Description Value="A single-unit Binary JData (BJData) parser and writer. BJData is a quasi-human-readable binary JSON format derived from UBJSON Draft 12, adding N-dimensional packed arrays, unsigned and half-precision numeric types, a byte type, structure-of-arrays containers and binary extension types. See https://neurojson.org/bjdata/draft4"/>
+    <License Value="Apache License, Version 2.0"/>
+    <Version Major="0" Minor="5"/>
+    <Files Count="1">
+      <Item1>
+        <Filename Value="bjdata.pas"/>
+        <UnitName Value="bjdata"/>
+      </Item1>
+    </Files>
+    <RequiredPkgs Count="1">
+      <Item1>
+        <PackageName Value="FCL"/>
+      </Item1>
+    </RequiredPkgs>
+    <UsageOptions>
+      <UnitPath Value="$(PkgOutDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+      <UseFileFilters Value="True"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>
