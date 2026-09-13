@@ -109,17 +109,69 @@ written. Element accessors (`ElemAsDouble`, `SetElem`) always address the
 payload in storage order, while `ToJSON` and `ExpandTypedArray` present the
 array in row-major (C) order for either layout.
 
+Performance
+-----------
+
+Measured with `test/bench.lpr` (FPC 3.2.2, `-O2`, x86-64 Linux), best of seven
+runs with the file already in memory. The reference is the C extension of
+[pybj](https://github.com/NeuroJSON/pybj) 0.6.0 on the same files and machine.
+
+| Document | | bjdata.pas | pybj 0.6.0 (C) |
+|---|---|---|---|
+| 24 MB of GitHub events (`largebj`), strings and small objects | decode | **556 MB/s** | 295 MB/s |
+| | encode | **509 MB/s** | 459 MB/s |
+| | to JSON | 208 MB/s | - |
+| 0.4 MB catalogue (`citm`), deeply nested objects | decode | **188 MB/s** | 110 MB/s |
+| | encode | **376 MB/s** | 107 MB/s |
+| 19 MB of packed numeric arrays | decode | 6.4 GB/s | 28 GB/s |
+| | encode | 3.2 GB/s | 4.8 GB/s |
+
+Two notes on the numbers:
+
+* On packed arrays pybj is faster because it hands the payload to NumPy as a
+  view of the input buffer, while `TBJData` copies it into a node that owns its
+  memory and outlives the buffer. Both are then bound by memory bandwidth.
+* Decoding builds a full document tree, so releasing it costs real time as
+  well: `doc.Free` on the 24 MB document takes about 26 ms, and the benchmark
+  reports it separately rather than hiding it.
+
+What the decoder does to get there, in rough order of what it was worth:
+
+* no `try..except` around each container - a container being filled is pushed
+  on a small stack instead, and one frame in `Parse` releases the stack if the
+  document turns out to be broken (a `setjmp` per container was 21% of decoding)
+* no implicit finalization frames in the hot routines: error messages are
+  formatted in separate routines, and strings are read straight into the field
+  that will hold them instead of through a local variable
+* nodes are allocated with `NewInstance` rather than a constructor, because a
+  constructor of a class with managed fields carries its own exception frame
+* a direct-mapped cache of recently seen object keys: documents repeat the same
+  field names over and over, and sharing those strings removes an allocation, a
+  copy and a release per key
+* `FreeInstance` finalizes the five managed fields directly instead of walking
+  the field RTTI table, which halves the cost of releasing a document
+* one-byte lengths and counts are decoded inline, and output goes through a
+  64 KB buffer instead of one stream call per marker byte
+
+The result is 2.5x the decoding speed of the first working version, from the
+same source, with the same output: `test/bench.lpr` and the regression suite
+were run against both.
+
 Building and testing
 --------------------
 
 ```
 make test        # build and run the regression suite
 make tools       # build bjd2json
+make bench BENCHFILES=big.bjd    # time the decoder, the encoder and ToJSON
 make cross       # additionally cross-check against the python bjdata module
 ```
 
-`test/bjdtest.lpr` holds 94 checks covering the examples of the specification,
-round-trips and error handling. `test/crosscheck.py` encodes a set of documents
+`test/bjdtest.lpr` holds 98 checks covering the examples of the specification,
+round-trips and error handling, including a sweep that parses every prefix and
+every single-byte corruption of a document to confirm that malformed input is
+rejected without crashing or leaking (run the suite with `-gh` to verify the
+second part). `test/crosscheck.py` encodes a set of documents
 with the reference [pybj](https://github.com/NeuroJSON/pybj) library, decodes
 them with `bjd2json`, re-encodes them with every combination of writer options
 and decodes the result with pybj again.

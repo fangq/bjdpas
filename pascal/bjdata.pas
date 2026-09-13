@@ -29,6 +29,7 @@ unit bjdata;
 ==============================================================================}
 
 {$mode objfpc}{$H+}
+{$INLINE ON}
 
 interface
 
@@ -155,11 +156,22 @@ type
     procedure NeedKind(AKind: TBJDataKind; const AWhat: string);
     procedure NeedContainer;
     procedure InsertSlot(AIndex: SizeInt);
+    procedure Grow;
+    { unchecked append, used by the decoder: the caller guarantees that the
+      node is a container of the matching flavour }
+    function AppendChild(AValue: TBJData): TBJData; overload; inline;
+    function AppendChild(const AKey: string; AValue: TBJData): TBJData; overload; inline;
+    function AppendSlot: SizeInt; inline;
   public
     constructor Create(AKind: TBJDataKind = bjkNull);
     destructor Destroy; override;
+    procedure FreeInstance; override;
 
     {---- constructors for each value type ----}
+    { allocate a bare node without running a constructor: a constructor of a
+      class with managed fields carries an implicit exception frame, which is
+      measurable when a document has millions of nodes }
+    class function NewFast(AKind: TBJDataKind; AMarker: AnsiChar): TBJData; inline;
     class function NewNull: TBJData;
     class function NewNoOp: TBJData;
     class function NewBool(AValue: Boolean): TBJData;
@@ -209,6 +221,7 @@ type
     procedure Delete(AIndex: SizeInt);
     procedure Remove(const AKey: string);
     procedure Clear;
+    procedure Reserve(ACapacity: SizeInt);
     function Clone: TBJData;
     function Path(const APath: string): TBJData;
 
@@ -258,6 +271,7 @@ function BJIsIntMarker(AMarker: AnsiChar): Boolean;
 function BJIsFloatMarker(AMarker: AnsiChar): Boolean;
 function BJIsFixedMarker(AMarker: AnsiChar): Boolean;
 function BJIsUnsignedMarker(AMarker: AnsiChar): Boolean;
+function BJPlainText(const AValue: string): Boolean;
 function BJIntMarkerFor(AValue: Int64): AnsiChar;
 function BJUIntMarkerFor(AValue: QWord): AnsiChar;
 function BJHalfToDouble(AValue: Word): Double;
@@ -517,30 +531,77 @@ begin
   end;
 end;
 
-function BJJSONEscape(const AValue: string): string;
+{ True when the string contains a character that JSON has to escape; most
+  strings do not, and can then be copied into the output in one piece }
+function BJPlainText(const AValue: string): Boolean;
 var
   i: Integer;
   c: AnsiChar;
 begin
-  Result := '';
   for i := 1 to Length(AValue) do
   begin
     c := AValue[i];
+    if (c < ' ') or (c = '"') or (c = '\') then
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+function BJJSONEscape(const AValue: string): string;
+const
+  HexDigits: array[0..15] of AnsiChar = '0123456789abcdef';
+var
+  i, n: Integer;
+  c: AnsiChar;
+begin
+  if BJPlainText(AValue) then
+    Exit(AValue);
+  SetLength(Result, Length(AValue) * 2 + 8);
+  n := 0;
+  for i := 1 to Length(AValue) do
+  begin
+    if n + 8 > Length(Result) then
+      SetLength(Result, Length(Result) * 2);
+    c := AValue[i];
     case c of
-      '"':  Result := Result + '\"';
-      '\':  Result := Result + '\\';
-      #8:   Result := Result + '\b';
-      #9:   Result := Result + '\t';
-      #10:  Result := Result + '\n';
-      #12:  Result := Result + '\f';
-      #13:  Result := Result + '\r';
+      '"', '\':
+        begin
+          Result[n + 1] := '\';
+          Result[n + 2] := c;
+          Inc(n, 2);
+        end;
+      #8, #9, #10, #12, #13:
+        begin
+          Result[n + 1] := '\';
+          case c of
+            #8:  Result[n + 2] := 'b';
+            #9:  Result[n + 2] := 't';
+            #10: Result[n + 2] := 'n';
+            #12: Result[n + 2] := 'f';
+          else
+            Result[n + 2] := 'r';
+          end;
+          Inc(n, 2);
+        end;
     else
       if c < ' ' then
-        Result := Result + '\u' + LowerCase(IntToHex(Ord(c), 4))
+      begin
+        Result[n + 1] := '\';
+        Result[n + 2] := 'u';
+        Result[n + 3] := '0';
+        Result[n + 4] := '0';
+        Result[n + 5] := HexDigits[Ord(c) shr 4];
+        Result[n + 6] := HexDigits[Ord(c) and 15];
+        Inc(n, 6);
+      end
       else
-        Result := Result + c;
+      begin
+        Result[n + 1] := c;
+        Inc(n);
+      end;
     end;
   end;
+  SetLength(Result, n);
 end;
 
 function BJHexStr(const ABuf: TBytes): string;
@@ -579,9 +640,45 @@ begin
 end;
 
 destructor TBJData.Destroy;
+var
+  i: SizeInt;
 begin
-  Clear;
+  { the child arrays themselves are released by FreeInstance, so only the
+    child nodes have to be walked here }
+  for i := 0 to FCount - 1 do
+    FItems[i].Free;
+  FCount := 0;
   inherited Destroy;
+end;
+
+{ releasing a node is as hot as building one, and the default cleanup walks
+  the field RTTI table of every instance. A node has five managed fields and
+  most nodes use only one of them, so the walk is replaced by direct tests }
+procedure TBJData.FreeInstance;
+begin
+  if ClassType = TBJData then
+  begin
+    if Pointer(FStr) <> nil then
+      FStr := '';
+    if Pointer(FItems) <> nil then
+      FItems := nil;
+    if Pointer(FNames) <> nil then
+      FNames := nil;
+    if Pointer(FBin) <> nil then
+      FBin := nil;
+    if Pointer(FDims) <> nil then
+      FDims := nil;
+    FreeMem(Pointer(Self));
+  end
+  else
+    inherited FreeInstance;
+end;
+
+class function TBJData.NewFast(AKind: TBJDataKind; AMarker: AnsiChar): TBJData;
+begin
+  Result := TBJData(NewInstance);
+  Result.FKind := AKind;
+  Result.FMarker := AMarker;
 end;
 
 class function TBJData.NewNull: TBJData;
@@ -892,6 +989,52 @@ begin
       FNames[i] := FNames[i - 1];
   end;
   Inc(FCount);
+end;
+
+procedure TBJData.Grow;
+begin
+  SetLength(FItems, Length(FItems) * 2 + 8);
+  if FKind = bjkObject then
+    SetLength(FNames, Length(FItems));
+end;
+
+procedure TBJData.Reserve(ACapacity: SizeInt);
+begin
+  if ACapacity > Length(FItems) then
+  begin
+    SetLength(FItems, ACapacity);
+    if FKind = bjkObject then
+      SetLength(FNames, ACapacity);
+  end;
+end;
+
+function TBJData.AppendChild(AValue: TBJData): TBJData;
+begin
+  if FCount >= Length(FItems) then
+    Grow;
+  FItems[FCount] := AValue;
+  Inc(FCount);
+  Result := AValue;
+end;
+
+{ reserve the next child slot and return its index; the decoder fills the name
+  and the node in place, which keeps both out of a managed local variable }
+function TBJData.AppendSlot: SizeInt;
+begin
+  if FCount >= Length(FItems) then
+    Grow;
+  Result := FCount;
+  Inc(FCount);
+end;
+
+function TBJData.AppendChild(const AKey: string; AValue: TBJData): TBJData;
+begin
+  if FCount >= Length(FItems) then
+    Grow;
+  FItems[FCount] := AValue;
+  FNames[FCount] := AKey;
+  Inc(FCount);
+  Result := AValue;
 end;
 
 function TBJData.Add(AValue: TBJData): TBJData;
@@ -1661,7 +1804,10 @@ var
         else
         begin
           sb.Append('"');
-          sb.Append(BJJSONEscape(ANode.FStr));
+          if BJPlainText(ANode.FStr) then
+            sb.Append(ANode.FStr)
+          else
+            sb.Append(BJJSONEscape(ANode.FStr));
           sb.Append('"');
         end;
       bjkTypedArray:
@@ -1700,7 +1846,10 @@ var
               sb.Append(',');
             Pad(ALevel + 1);
             sb.Append('"');
-            sb.Append(BJJSONEscape(ANode.FNames[i]));
+            if BJPlainText(ANode.FNames[i]) then
+              sb.Append(ANode.FNames[i])
+            else
+              sb.Append(BJJSONEscape(ANode.FNames[i]));
             sb.Append('":');
             if AIndent > 0 then
               sb.Append(' ');
@@ -1837,21 +1986,41 @@ end;
   TBJReader - the decoder
 ==============================================================================}
 
+const
+  { direct-mapped cache of recently seen object keys; records in a document
+    normally repeat the same handful of names, and sharing those strings
+    removes one allocation, one copy and one release per key }
+  BJKeyCacheSize = 1024;
+  BJKeyCacheMaxLen = 64;
+
 type
   TBJReader = class(TObject)
   private
     FBuf: PByte;
+    FCur: PByte;
+    FEnd: PByte;
     FSize: PtrUInt;
-    FPos: PtrUInt;
     FOptions: TBJDataParseOptions;
-    procedure Need(ACount: PtrUInt);
+    FPending: TBJDataItems;      // containers under construction, not yet owned
+    FPendingCount: SizeInt;
+    FKeyHash: array[0..BJKeyCacheSize - 1] of LongWord;
+    FKeyText: array[0..BJKeyCacheSize - 1] of string;
+    function Offset: PtrUInt; inline;
+    procedure FailEOF(ACount: PtrUInt);
+    procedure FailMarker(const AFmt: string; AMarker: AnsiChar);
+    procedure FailUnknown(AMarker: AnsiChar);
+    procedure Need(ACount: PtrUInt); inline;
     procedure Fail(const AMsg: string);
-    function AtEOF: Boolean;
-    function ReadChar: AnsiChar;
-    function PeekChar: AnsiChar;
-    procedure SkipChar;
+    function AtEOF: Boolean; inline;
+    function ReadChar: AnsiChar; inline;
+    function PeekChar: AnsiChar; inline;
+    procedure SkipChar; inline;
+    procedure PushPending(ANode: TBJData); inline;
+    procedure PopPending; inline;
     procedure Expect(AMarker: AnsiChar);
     function ReadStr(ALength: PtrUInt): string;
+    procedure ReadStrInto(out AText: string; ALength: PtrUInt);
+    procedure ReadKeyInto(out AText: string);
     function ReadIntValue(AMarker: AnsiChar): Int64;
     function ReadFloatValue(AMarker: AnsiChar): Double;
     function ReadSize: Int64;
@@ -1862,7 +2031,10 @@ type
     function ReadPacked(AMarker: AnsiChar; const ADims: TBJDataDims;
       AColumnMajor: Boolean): TBJData;
     function ReadArrayNode: TBJData;
+    function ReadArrayOptimized: TBJData;
     function ReadObjectNode: TBJData;
+    function ReadObjectOptimized: TBJData;
+    function ReadExtensionNode: TBJData;
     function ReadFieldSpec: TBJSoAField;
     function ReadSchema(ATerminator: AnsiChar): TBJSoAFieldArray;
     function ReadSoAValue(AField: TBJSoAField; ARecord: Int64): TBJData;
@@ -1870,8 +2042,9 @@ type
   public
     constructor Create(ABuffer: PByte; ASize: PtrUInt;
       AOptions: TBJDataParseOptions);
+    procedure FreePending;
     function ReadValue: TBJData;
-    property Position: PtrUInt read FPos;
+    property Position: PtrUInt read Offset;
   end;
 
 constructor TBJReader.Create(ABuffer: PByte; ASize: PtrUInt;
@@ -1879,53 +2052,101 @@ constructor TBJReader.Create(ABuffer: PByte; ASize: PtrUInt;
 begin
   inherited Create;
   FBuf := ABuffer;
+  FCur := ABuffer;
+  FEnd := ABuffer + ASize;
   FSize := ASize;
-  FPos := 0;
   FOptions := AOptions;
+end;
+
+function TBJReader.Offset: PtrUInt;
+begin
+  Result := FCur - FBuf;
 end;
 
 procedure TBJReader.Fail(const AMsg: string);
 begin
-  raise EBJData.CreateFmt('%s at byte offset %d', [AMsg, FPos]);
+  raise EBJData.CreateFmt('%s at byte offset %d', [AMsg, Offset]);
+end;
+
+procedure TBJReader.FailEOF(ACount: PtrUInt);
+begin
+  Fail(Format('unexpected end of input, %d more byte(s) needed', [ACount]));
+end;
+
+{ error messages are built in separate routines: a Format call in a decoding
+  routine forces the compiler to wrap that routine in a finalization frame }
+procedure TBJReader.FailMarker(const AFmt: string; AMarker: AnsiChar);
+begin
+  Fail(Format(AFmt, [AMarker]));
+end;
+
+procedure TBJReader.FailUnknown(AMarker: AnsiChar);
+begin
+  Fail(Format('unknown type marker "%s" (0x%.2x)', [AMarker, Ord(AMarker)]));
 end;
 
 procedure TBJReader.Need(ACount: PtrUInt);
 begin
-  if FPos + ACount > FSize then
-    Fail(Format('unexpected end of input, %d more byte(s) needed', [ACount]));
+  if FCur + ACount > FEnd then
+    FailEOF(ACount);
 end;
 
 function TBJReader.AtEOF: Boolean;
 begin
-  Result := FPos >= FSize;
+  Result := FCur >= FEnd;
 end;
 
 function TBJReader.ReadChar: AnsiChar;
 begin
-  Need(1);
-  Result := AnsiChar(FBuf[FPos]);
-  Inc(FPos);
+  if FCur >= FEnd then
+    FailEOF(1);
+  Result := AnsiChar(FCur^);
+  Inc(FCur);
 end;
 
 function TBJReader.PeekChar: AnsiChar;
 begin
-  Need(1);
-  Result := AnsiChar(FBuf[FPos]);
+  if FCur >= FEnd then
+    FailEOF(1);
+  Result := AnsiChar(FCur^);
 end;
 
 procedure TBJReader.SkipChar;
 begin
-  Need(1);
-  Inc(FPos);
+  if FCur >= FEnd then
+    FailEOF(1);
+  Inc(FCur);
+end;
+
+{ containers are registered while they are being filled: they are not yet
+  owned by a parent, so this is what an aborted parse has to release }
+procedure TBJReader.PushPending(ANode: TBJData);
+begin
+  if FPendingCount >= Length(FPending) then
+    SetLength(FPending, Length(FPending) * 2 + 32);
+  FPending[FPendingCount] := ANode;
+  Inc(FPendingCount);
+end;
+
+procedure TBJReader.PopPending;
+begin
+  Dec(FPendingCount);
+end;
+
+procedure TBJReader.FreePending;
+var
+  i: SizeInt;
+begin
+  { deepest first: none of these nodes is a child of another one }
+  for i := FPendingCount - 1 downto 0 do
+    FPending[i].Free;
+  FPendingCount := 0;
 end;
 
 procedure TBJReader.Expect(AMarker: AnsiChar);
-var
-  c: AnsiChar;
 begin
-  c := ReadChar;
-  if c <> AMarker then
-    Fail(Format('expected marker "%s" but found "%s"', [AMarker, c]));
+  if ReadChar <> AMarker then
+    FailMarker('expected marker "%s"', AMarker);
 end;
 
 function TBJReader.ReadStr(ALength: PtrUInt): string;
@@ -1933,8 +2154,20 @@ begin
   Need(ALength);
   SetLength(Result, ALength);
   if ALength > 0 then
-    Move(FBuf[FPos], Result[1], ALength);
-  Inc(FPos, ALength);
+    Move(FCur^, Result[1], ALength);
+  Inc(FCur, ALength);
+end;
+
+{ read a string straight into its destination: no temporary, no reference
+  count pair and no implicit finalization frame in the caller }
+procedure TBJReader.ReadStrInto(out AText: string; ALength: PtrUInt);
+begin
+  if FCur + ALength > FEnd then
+    FailEOF(ALength);
+  SetLength(AText, ALength);
+  if ALength > 0 then
+    Move(FCur^, AText[1], ALength);
+  Inc(FCur, ALength);
 end;
 
 function TBJReader.ReadIntValue(AMarker: AnsiChar): Int64;
@@ -1947,12 +2180,12 @@ var
 begin
   sz := BJMarkerSize(AMarker);
   if sz = 0 then
-    Fail(Format('"%s" is not a fixed-length numeric marker', [AMarker]));
+    FailMarker('"%s" is not a fixed-length numeric marker', AMarker);
   Need(sz);
   case sz of
     1:
       begin
-        v8 := FBuf[FPos];
+        v8 := FCur^;
         if AMarker = bjmInt8 then
           Result := ShortInt(v8)
         else
@@ -1960,7 +2193,7 @@ begin
       end;
     2:
       begin
-        Move(FBuf[FPos], v16, 2);
+        Move(FCur^, v16, 2);
         BJFromLE(@v16, 2, 1);
         if AMarker = bjmInt16 then
           Result := SmallInt(v16)
@@ -1969,7 +2202,7 @@ begin
       end;
     4:
       begin
-        Move(FBuf[FPos], v32, 4);
+        Move(FCur^, v32, 4);
         BJFromLE(@v32, 4, 1);
         if AMarker = bjmInt32 then
           Result := LongInt(v32)
@@ -1978,12 +2211,12 @@ begin
       end;
   else
     begin
-      Move(FBuf[FPos], v64, 8);
+      Move(FCur^, v64, 8);
       BJFromLE(@v64, 8, 1);
       Result := v64;
     end;
   end;
-  Inc(FPos, sz);
+  Inc(FCur, sz);
 end;
 
 function TBJReader.ReadFloatValue(AMarker: AnsiChar): Double;
@@ -1996,31 +2229,31 @@ begin
     bjmFloat16:
       begin
         Need(2);
-        Move(FBuf[FPos], v16, 2);
+        Move(FCur^, v16, 2);
         BJFromLE(@v16, 2, 1);
-        Inc(FPos, 2);
+        Inc(FCur, 2);
         Result := BJHalfToDouble(v16);
       end;
     bjmFloat32:
       begin
         Need(4);
-        Move(FBuf[FPos], v32, 4);
+        Move(FCur^, v32, 4);
         BJFromLE(@v32, 4, 1);
-        Inc(FPos, 4);
+        Inc(FCur, 4);
         Result := v32;
       end;
     bjmFloat64:
       begin
         Need(8);
-        Move(FBuf[FPos], v64, 8);
+        Move(FCur^, v64, 8);
         BJFromLE(@v64, 8, 1);
-        Inc(FPos, 8);
+        Inc(FCur, 8);
         Result := v64;
       end;
   else
     begin
       Result := 0;
-      Fail(Format('"%s" is not a floating-point marker', [AMarker]));
+      FailMarker('"%s" is not a floating-point marker', AMarker);
     end;
   end;
 end;
@@ -2031,8 +2264,18 @@ var
   m: AnsiChar;
 begin
   m := ReadChar;
+  if (m = bjmUInt8) or (m = bjmInt8) then
+  begin
+    if FCur >= FEnd then
+      FailEOF(1);
+    Result := FCur^;
+    Inc(FCur);
+    if (m = bjmInt8) and (Result > 127) then
+      Fail('a negative length or count is not allowed');
+    Exit;
+  end;
   if not BJIsIntMarker(m) then
-    Fail(Format('"%s" cannot be used as a length or count', [m]));
+    FailMarker('"%s" cannot be used as a length or count', m);
   Result := ReadIntValue(m);
   if Result < 0 then
     Fail('a negative length or count is not allowed');
@@ -2054,6 +2297,63 @@ begin
   if len < 0 then
     Fail('a negative key length is not allowed');
   Result := ReadStr(len);
+end;
+
+procedure TBJReader.ReadKeyInto(out AText: string);
+var
+  m: AnsiChar;
+  len: Int64;
+  h: LongWord;
+  slot: Integer;
+  p: PByte;
+begin
+  m := ReadChar;
+  if (m = bjmUInt8) or (m = bjmInt8) then
+  begin
+    if FCur >= FEnd then
+      FailEOF(1);
+    len := FCur^;
+    Inc(FCur);
+    if (m = bjmInt8) and (len > 127) then
+      Fail('a negative key length is not allowed');
+  end
+  else
+  begin
+    if m = bjmString then
+      m := ReadChar;
+    if not BJIsIntMarker(m) then
+      FailMarker('"%s" is not a valid key length marker', m);
+    len := ReadIntValue(m);
+    if len < 0 then
+      Fail('a negative key length is not allowed');
+  end;
+  if (len = 0) or (len > BJKeyCacheMaxLen) then
+  begin
+    ReadStrInto(AText, len);
+    Exit;
+  end;
+  if FCur + len > FEnd then
+    FailEOF(len);
+  p := FCur;
+  { a weak hash is fine here: every hit is confirmed with a byte comparison,
+    so a collision only costs a re-read of the key }
+  h := LongWord(len);
+  if len >= 4 then
+    h := h xor PLongWord(p)^ xor (PLongWord(@p[len - 4])^ * 2246822519)
+  else
+    h := h xor p^ xor (LongWord(p[len - 1]) shl 8);
+  h := h * 2654435761;
+  slot := (h shr 13) and (BJKeyCacheSize - 1);
+  if (FKeyHash[slot] = h) and (Length(FKeyText[slot]) = len) and
+     CompareMem(p, PAnsiChar(FKeyText[slot]), len) then
+  begin
+    AText := FKeyText[slot];
+    Inc(FCur, len);
+    Exit;
+  end;
+  ReadStrInto(AText, len);
+  FKeyHash[slot] := h;
+  FKeyText[slot] := AText;
 end;
 
 { read the dimension list of an optimized array; the opening '[' has already
@@ -2140,64 +2440,86 @@ begin
   end;
 end;
 
+function TBJReader.ReadExtensionNode: TBJData;
+var
+  id, len: Int64;
+  buf: TBytes;
+begin
+  id := ReadSize;
+  len := ReadSize;
+  SetLength(buf, len);
+  if len > 0 then
+  begin
+    Need(len);
+    Move(FCur^, buf[0], len);
+    Inc(FCur, len);
+  end;
+  Result := TBJData.NewExtension(id, buf);
+end;
+
 function TBJReader.ReadScalar(AMarker: AnsiChar): TBJData;
 var
-  len: Int64;
-  id: Int64;
-  buf: TBytes;
   q: QWord;
+  iv, len: Int64;
+  fv: Double;
 begin
   case AMarker of
     bjmNull:
-      Result := TBJData.NewNull;
+      Result := TBJData.NewFast(bjkNull, bjmNull);
     bjmNoOp:
-      Result := TBJData.NewNoOp;
+      Result := TBJData.NewFast(bjkNoOp, bjmNoOp);
     bjmTrue:
-      Result := TBJData.NewBool(True);
+      begin
+        Result := TBJData.NewFast(bjkBoolean, bjmTrue);
+        Result.FInt := 1;
+      end;
     bjmFalse:
-      Result := TBJData.NewBool(False);
+      Result := TBJData.NewFast(bjkBoolean, bjmFalse);
     bjmUInt64:
       begin
         q := QWord(ReadIntValue(AMarker));
-        Result := TBJData.NewUInt(q);
-        Result.FMarker := bjmUInt64;
+        if q <= QWord(High(Int64)) then
+          Result := TBJData.NewFast(bjkInt, bjmUInt64)
+        else
+          Result := TBJData.NewFast(bjkUInt, bjmUInt64);
+        Result.FInt := Int64(q);
       end;
     bjmInt8, bjmUInt8, bjmInt16, bjmUInt16, bjmInt32, bjmUInt32, bjmInt64,
     bjmByte:
-      Result := TBJData.NewInt(ReadIntValue(AMarker), AMarker);
+      begin
+        iv := ReadIntValue(AMarker);
+        Result := TBJData.NewFast(bjkInt, AMarker);
+        Result.FInt := iv;
+      end;
     bjmChar:
       begin
         Need(1);
-        Result := TBJData.Create(bjkString);
-        Result.FMarker := bjmChar;
-        Result.FStr := AnsiChar(FBuf[FPos]);
-        Inc(FPos);
+        Result := TBJData.NewFast(bjkString, bjmChar);
+        Result.FStr := AnsiChar(FCur^);
+        Inc(FCur);
       end;
     bjmFloat16, bjmFloat32, bjmFloat64:
-      Result := TBJData.NewFloat(ReadFloatValue(AMarker), AMarker);
+      begin
+        fv := ReadFloatValue(AMarker);
+        Result := TBJData.NewFast(bjkFloat, AMarker);
+        Result.FFloat := fv;
+      end;
     bjmString:
       begin
         len := ReadSize;
-        Result := TBJData.NewString(ReadStr(len));
+        Need(len);
+        Result := TBJData.NewFast(bjkString, bjmString);
+        ReadStrInto(Result.FStr, len);
       end;
     bjmHighPrec:
       begin
         len := ReadSize;
-        Result := TBJData.NewHighPrec(ReadStr(len));
+        Need(len);
+        Result := TBJData.NewFast(bjkString, bjmHighPrec);
+        ReadStrInto(Result.FStr, len);
       end;
     bjmExtension:
-      begin
-        id := ReadSize;
-        len := ReadSize;
-        SetLength(buf, len);
-        if len > 0 then
-        begin
-          Need(len);
-          Move(FBuf[FPos], buf[0], len);
-          Inc(FPos, len);
-        end;
-        Result := TBJData.NewExtension(id, buf);
-      end;
+      Result := ReadExtensionNode;
     bjmArrayStart:
       Result := ReadArrayNode;
     bjmObjectStart:
@@ -2205,8 +2527,7 @@ begin
   else
     begin
       Result := nil;
-      Fail(Format('unknown type marker "%s" (0x%.2x)',
-        [AMarker, Ord(AMarker)]));
+      FailUnknown(AMarker);
     end;
   end;
 end;
@@ -2232,16 +2553,15 @@ begin
   n := BJDimProduct(ADims);
   nbytes := n * sz;
   Need(nbytes);
-  Result := TBJData.Create(bjkTypedArray);
-  Result.FMarker := AMarker;
+  Result := TBJData.NewFast(bjkTypedArray, AMarker);
   Result.FDims := Copy(ADims, 0, Length(ADims));
   Result.FColumnMajor := AColumnMajor;
   SetLength(Result.FBin, nbytes);
   if nbytes > 0 then
   begin
-    Move(FBuf[FPos], Result.FBin[0], nbytes);
+    Move(FCur^, Result.FBin[0], nbytes);
     BJFromLE(@Result.FBin[0], sz, n);
-    Inc(FPos, nbytes);
+    Inc(FCur, nbytes);
   end;
   if bjpExpandTypedArray in FOptions then
   begin
@@ -2254,17 +2574,43 @@ begin
   end;
 end;
 
+{ the common case: a plain array without a count or a type; kept free of
+  managed local variables so that the compiler does not wrap it in an
+  implicit finalization frame }
 function TBJReader.ReadArrayNode: TBJData;
+var
+  c: AnsiChar;
+  idx: SizeInt;
+begin
+  c := PeekChar;
+  if (c = bjmTypeMark) or (c = bjmCountMark) then
+    Exit(ReadArrayOptimized);
+  Result := TBJData.NewFast(bjkArray, bjmArrayStart);
+  PushPending(Result);
+  while True do
+  begin
+    c := PeekChar;
+    if c = bjmArrayEnd then
+    begin
+      SkipChar;
+      Break;
+    end;
+    idx := Result.AppendSlot;
+    Result.FItems[idx] := ReadValue;
+  end;
+  PopPending;
+end;
+
+function TBJReader.ReadArrayOptimized: TBJData;
 var
   c, et: AnsiChar;
   dims: TBJDataDims;
   colmajor: Boolean;
   n, i: Int64;
 begin
-  c := PeekChar;
+  c := ReadChar;
   if c = bjmTypeMark then
   begin
-    SkipChar;
     et := ReadChar;
     if et = bjmObjectStart then
       Exit(ReadSoA(True));                     // row-major SoA record
@@ -2274,124 +2620,102 @@ begin
       Exit(ReadPacked(et, dims, colmajor));
     { lenient: a non-fixed optimized type (allowed by UBJSON, not by BJData) }
     n := BJDimProduct(dims);
-    Result := TBJData.NewArray;
-    try
-      for i := 0 to n - 1 do
-        Result.Add(ReadScalar(et));
-    except
-      Result.Free;
-      raise;
-    end;
-    if Length(dims) > 1 then
-    begin
-      Result.FDims := Copy(dims, 0, Length(dims));
-      Result.FColumnMajor := colmajor;
-    end;
-    Exit;
-  end;
-  if c = bjmCountMark then
+    Result := TBJData.NewFast(bjkArray, bjmArrayStart);
+    PushPending(Result);
+    Result.Reserve(n);
+    for i := 0 to n - 1 do
+      Result.AppendChild(ReadScalar(et));
+    PopPending;
+  end
+  else
   begin
-    SkipChar;
     ReadCountSpec(dims, colmajor);
     n := BJDimProduct(dims);
-    Result := TBJData.NewArray;
-    try
-      for i := 0 to n - 1 do
-        Result.Add(ReadValue);
-    except
-      Result.Free;
-      raise;
-    end;
-    if Length(dims) > 1 then
-    begin
-      Result.FDims := Copy(dims, 0, Length(dims));
-      Result.FColumnMajor := colmajor;
-    end;
-    Exit;
+    Result := TBJData.NewFast(bjkArray, bjmArrayStart);
+    PushPending(Result);
+    Result.Reserve(n);
+    for i := 0 to n - 1 do
+      Result.AppendChild(ReadValue);
+    PopPending;
   end;
-  Result := TBJData.NewArray;
-  try
-    while True do
-    begin
-      c := PeekChar;
-      if c = bjmArrayEnd then
-      begin
-        SkipChar;
-        Break;
-      end;
-      Result.Add(ReadValue);
-    end;
-  except
-    Result.Free;
-    raise;
+  if Length(dims) > 1 then
+  begin
+    Result.FDims := Copy(dims, 0, Length(dims));
+    Result.FColumnMajor := colmajor;
   end;
 end;
 
 function TBJReader.ReadObjectNode: TBJData;
 var
+  c: AnsiChar;
+  idx: SizeInt;
+begin
+  c := PeekChar;
+  if (c = bjmTypeMark) or (c = bjmCountMark) then
+    Exit(ReadObjectOptimized);
+  Result := TBJData.NewFast(bjkObject, bjmObjectStart);
+  PushPending(Result);
+  while True do
+  begin
+    c := PeekChar;
+    if c = bjmObjectEnd then
+    begin
+      SkipChar;
+      Break;
+    end;
+    if c = bjmNoOp then
+    begin
+      SkipChar;
+      Continue;
+    end;
+    idx := Result.AppendSlot;
+    ReadKeyInto(Result.FNames[idx]);
+    Result.FItems[idx] := ReadValue;
+  end;
+  PopPending;
+end;
+
+function TBJReader.ReadObjectOptimized: TBJData;
+var
   c, et: AnsiChar;
   dims: TBJDataDims;
   colmajor: Boolean;
   n, i: Int64;
-  key: string;
+  idx: SizeInt;
 begin
-  c := PeekChar;
+  c := ReadChar;
   if c = bjmTypeMark then
   begin
-    SkipChar;
     et := ReadChar;
     if et = bjmObjectStart then
       Exit(ReadSoA(False));                    // column-major SoA record
     Expect(bjmCountMark);
     ReadCountSpec(dims, colmajor);
     n := BJDimProduct(dims);
-    Result := TBJData.NewObject;
-    try
-      for i := 0 to n - 1 do
-      begin
-        key := ReadKey;
-        Result.Add(key, ReadScalar(et));
-      end;
-    except
-      Result.Free;
-      raise;
+    Result := TBJData.NewFast(bjkObject, bjmObjectStart);
+    PushPending(Result);
+    Result.Reserve(n);
+    for i := 0 to n - 1 do
+    begin
+      idx := Result.AppendSlot;
+      ReadKeyInto(Result.FNames[idx]);
+      Result.FItems[idx] := ReadScalar(et);
     end;
+    PopPending;
     Exit;
   end;
-  Result := TBJData.NewObject;
-  try
-    if c = bjmCountMark then
-    begin
-      SkipChar;
-      ReadCountSpec(dims, colmajor);
-      n := BJDimProduct(dims);
-      for i := 0 to n - 1 do
-      begin
-        key := ReadKey;
-        Result.Add(key, ReadValue);
-      end;
-      Exit;
-    end;
-    while True do
-    begin
-      c := PeekChar;
-      if c = bjmObjectEnd then
-      begin
-        SkipChar;
-        Break;
-      end;
-      if c = bjmNoOp then
-      begin
-        SkipChar;
-        Continue;
-      end;
-      key := ReadKey;
-      Result.Add(key, ReadValue);
-    end;
-  except
-    Result.Free;
-    raise;
+  ReadCountSpec(dims, colmajor);
+  n := BJDimProduct(dims);
+  Result := TBJData.NewFast(bjkObject, bjmObjectStart);
+  PushPending(Result);
+  Result.Reserve(n);
+  for i := 0 to n - 1 do
+  begin
+    idx := Result.AppendSlot;
+    ReadKeyInto(Result.FNames[idx]);
+    Result.FItems[idx] := ReadValue;
   end;
+  PopPending;
 end;
 
 {------------------------------------------------------------------------------
@@ -2536,8 +2860,8 @@ begin
           Need(1);
           Result := TBJData.Create(bjkString);
           Result.FMarker := bjmChar;
-          Result.FStr := AnsiChar(FBuf[FPos]);
-          Inc(FPos);
+          Result.FStr := AnsiChar(FCur^);
+          Inc(FCur);
         end
         else if AField.Marker = bjmUInt64 then
           Result := TBJData.NewUInt(QWord(ReadIntValue(AField.Marker)))
@@ -2582,15 +2906,19 @@ begin
     skArray:
       begin
         Result := TBJData.NewArray;
+        PushPending(Result);
         for i := 0 to High(AField.Fields) do
           Result.Add(ReadSoAValue(AField.Fields[i], ARecord));
+        PopPending;
       end;
     skObject:
       begin
         Result := TBJData.NewObject;
+        PushPending(Result);
         for i := 0 to High(AField.Fields) do
           Result.Add(AField.Fields[i].Name,
             ReadSoAValue(AField.Fields[i], ARecord));
+        PopPending;
       end;
   else
     begin
@@ -2843,13 +3171,19 @@ begin
   Result := True;
 end;
 
+const
+  BJWriteBufferSize = 64 * 1024;
+
 type
   TBJWriter = class(TObject)
   private
     FStream: TStream;
     FOptions: TBJDataWriteOptions;
+    FOut: array[0..BJWriteBufferSize - 1] of Byte;
+    FOutLen: Integer;
+    procedure Flush;
     procedure W(const ABuffer; ACount: PtrUInt);
-    procedure WChar(AMarker: AnsiChar);
+    procedure WChar(AMarker: AnsiChar); inline;
     procedure WIntAs(AMarker: AnsiChar; AValue: Int64);
     procedure WFloatAs(AMarker: AnsiChar; AValue: Double);
     procedure WSize(AValue: Int64);
@@ -2865,6 +3199,7 @@ type
     procedure WSoAValue(AField: TBJSoAField; ANode: TBJData);
   public
     constructor Create(AStream: TStream; AOptions: TBJDataWriteOptions);
+    destructor Destroy; override;
     procedure WValue(ANode: TBJData);
   end;
 
@@ -2875,15 +3210,46 @@ begin
   FOptions := AOptions;
 end;
 
+destructor TBJWriter.Destroy;
+begin
+  Flush;
+  inherited Destroy;
+end;
+
+procedure TBJWriter.Flush;
+begin
+  if FOutLen > 0 then
+  begin
+    FStream.WriteBuffer(FOut[0], FOutLen);
+    FOutLen := 0;
+  end;
+end;
+
+{ output goes through a fixed buffer: a BJData stream is written in very small
+  pieces, and one stream call per marker byte dominates everything else }
 procedure TBJWriter.W(const ABuffer; ACount: PtrUInt);
 begin
-  if ACount > 0 then
-    FStream.WriteBuffer(ABuffer, ACount);
+  if ACount = 0 then
+    Exit;
+  if FOutLen + ACount > BJWriteBufferSize then
+  begin
+    Flush;
+    if ACount >= BJWriteBufferSize then
+    begin
+      FStream.WriteBuffer(ABuffer, ACount);
+      Exit;
+    end;
+  end;
+  Move(ABuffer, FOut[FOutLen], ACount);
+  Inc(FOutLen, ACount);
 end;
 
 procedure TBJWriter.WChar(AMarker: AnsiChar);
 begin
-  FStream.WriteBuffer(AMarker, 1);
+  if FOutLen >= BJWriteBufferSize then
+    Flush;
+  FOut[FOutLen] := Byte(AMarker);
+  Inc(FOutLen);
 end;
 
 procedure TBJWriter.WIntAs(AMarker: AnsiChar; AValue: Int64);
@@ -3644,7 +4010,12 @@ var
 begin
   rd := TBJReader.Create(PByte(@ABuffer), ALength, AOptions);
   try
-    Result := rd.ReadValue;
+    try
+      Result := rd.ReadValue;
+    except
+      rd.FreePending;
+      raise;
+    end;
   finally
     rd.Free;
   end;
@@ -3691,6 +4062,7 @@ begin
   wr := TBJWriter.Create(AStream, AOptions);
   try
     wr.WValue(Self);
+    wr.Flush;
   finally
     wr.Free;
   end;
@@ -3711,18 +4083,22 @@ end;
 
 function TBJData.ToBytes(AOptions: TBJDataWriteOptions): TBytes;
 var
-  ms: TMemoryStream;
+  ms: TBytesStream;
+  n: Int64;
 begin
   Result := nil;
-  ms := TMemoryStream.Create;
+  ms := TBytesStream.Create;
   try
     SaveToStream(ms, AOptions);
-    SetLength(Result, ms.Size);
-    if ms.Size > 0 then
-      Move(ms.Memory^, Result[0], ms.Size);
+    n := ms.Position;
+    { hand the buffer over instead of copying it: once the stream has been
+      released the reference is unique and the trailing slack is cut off
+      without moving the payload }
+    Result := ms.Bytes;
   finally
     ms.Free;
   end;
+  SetLength(Result, n);
 end;
 
 initialization

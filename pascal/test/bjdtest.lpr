@@ -675,6 +675,90 @@ begin
   d.Free;
 end;
 
+// parse every prefix of a document: a truncated stream must raise instead of
+// crashing, and must not leave anything behind (run under -gh to check)
+procedure TestTruncation;
+var
+  doc: TBJData;
+  full, part: TBytes;
+  i, raised, parsed: Integer;
+  b: TBuf;
+begin
+  WriteLn('truncated input');
+
+  b := TBuf.Create;
+  try
+    // a document touching most of the decoder: packed array, SoA, strings,
+    // extension, nested containers
+    b.Hex('7B');
+    b.Hex('6903'); b.Txt('arr'); b.Hex('5B2455235B2455236902 0203' + '010203040506');
+    b.Hex('6903'); b.Txt('str'); b.Hex('5369056865' + '6C6C6F');
+    b.Hex('6903'); b.Txt('ext'); b.Hex('45690869080000404000008040');
+    b.Hex('6903'); b.Txt('soa'); b.Hex('5B247B');
+    b.Hex('6901'); b.Txt('x'); b.Hex('44');
+    b.Hex('6901'); b.Txt('n'); b.Hex('54');
+    b.Hex('6904'); b.Txt('name'); b.Hex('5B24555D');
+    b.Hex('7D'); b.Hex('236902');
+    b.F64(1.0); b.U8(Ord('T')); b.U8(0);
+    b.F64(2.0); b.U8(Ord('F')); b.U8(1);
+    b.U8(0); b.U8(3); b.U8(6); b.Txt('AmyBob');
+    b.Hex('6903'); b.Txt('obj'); b.Hex('7B690161' + '5A' + '7D');
+    b.Hex('7D');
+    full := b.Bytes;
+  finally
+    b.Free;
+  end;
+
+  doc := TBJData.ParseBytes(full);
+  CheckEq(doc.ToJSON(0),
+    '{"arr":[[1,2,3],[4,5,6]],"str":"hello","ext":{"_ExtType_":8,' +
+    '"_ExtValue_":[3,4]},"soa":[{"x":1,"n":true,"name":"Amy"},' +
+    '{"x":2,"n":false,"name":"Bob"}],"obj":{"a":null}}',
+    'reference document for the truncation sweep');
+  doc.Free;
+
+  raised := 0;
+  parsed := 0;
+  for i := 1 to Length(full) - 1 do
+  begin
+    part := Copy(full, 0, i);
+    try
+      doc := TBJData.ParseBytes(part);
+      doc.Free;
+      Inc(parsed);
+    except
+      on E: EBJData do
+        Inc(raised);
+      on E: Exception do
+      begin
+        WriteLn('       unexpected ', E.ClassName, ' at length ', i, ': ', E.Message);
+        Inc(parsed);
+      end;
+    end;
+  end;
+  Check(raised + parsed = Length(full) - 1, 'every prefix was handled');
+  Check(raised > Length(full) div 2,
+    Format('%d of %d truncated prefixes were rejected', [raised, raised + parsed]));
+
+  // the same sweep with a corrupted byte at each position
+  raised := 0;
+  for i := 0 to Length(full) - 1 do
+  begin
+    part := Copy(full, 0, Length(full));
+    part[i] := Byte(not part[i]);
+    try
+      doc := TBJData.ParseBytes(part);
+      doc.Free;
+    except
+      on E: EBJData do
+        Inc(raised);
+      on E: Exception do
+        WriteLn('       unexpected ', E.ClassName, ' at byte ', i, ': ', E.Message);
+    end;
+  end;
+  Check(raised > 0, Format('%d corrupted documents were rejected', [raised]));
+end;
+
 begin
   WriteLn('bjdata.pas ', BJDataVersion, ' test suite');
   WriteLn;
@@ -686,6 +770,7 @@ begin
   TestSoAWrite;
   TestRoundTrip;
   TestEdgeCases;
+  TestTruncation;
   WriteLn;
   WriteLn(Format('%d test(s), %d failure(s)', [TestCount, FailCount]));
   if FailCount > 0 then
