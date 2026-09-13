@@ -7,7 +7,32 @@ program bench;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, DateUtils, bjdata;
+  SysUtils, Classes, DateUtils, {$IFDEF UNIX}BaseUnix, Unix,{$ENDIF} bjdata;
+
+{ Now() only resolves milliseconds, which is not enough for the faster
+  operations on the smaller files. The value is kept in integer microseconds
+  so that no precision is lost before the difference is taken }
+function Clock: Int64;
+{$IFDEF UNIX}
+var
+  tv: TTimeVal;
+begin
+  fpgettimeofday(@tv, nil);
+  Result := Int64(tv.tv_sec) * 1000000 + tv.tv_usec;
+end;
+{$ELSE}
+begin
+  Result := Round(Now * 86400.0 * 1000000.0);
+end;
+{$ENDIF}
+
+function Rate(AMegaBytes, ASeconds: Double): Double;
+begin
+  if ASeconds > 0 then
+    Result := AMegaBytes / ASeconds
+  else
+    Result := 0;
+end;
 
 var
   Repeats: Integer = 3;
@@ -15,6 +40,167 @@ var
   DoDecode: Boolean = True;
   DoEncode: Boolean = True;
   DoJSON: Boolean = True;
+  DoScan: Boolean = False;
+
+{ walk the document without building anything: this is the byte-processing
+  floor of the format, i.e. what is left to gain if node construction were
+  free. Only the constructs used by the benchmark files are handled. }
+var
+  ScanP, ScanE: PByte;
+  ScanNodes: Int64;
+
+procedure ScanFail(const AMsg: string);
+begin
+  raise Exception.Create(AMsg);
+end;
+
+function ScanByte: Byte; inline;
+begin
+  if ScanP >= ScanE then
+    ScanFail('eof');
+  Result := ScanP^;
+  Inc(ScanP);
+end;
+
+function ScanInt(AMarker: AnsiChar): Int64;
+var
+  n: Integer;
+begin
+  n := BJMarkerSize(AMarker);
+  if (n = 0) or (ScanP + n > ScanE) then
+    ScanFail('bad size marker');
+  case n of
+    1: if AMarker = 'i' then Result := PShortInt(ScanP)^ else Result := ScanP^;
+    2: if AMarker = 'I' then Result := PSmallInt(ScanP)^ else Result := PWord(ScanP)^;
+    4: if AMarker = 'l' then Result := PLongInt(ScanP)^ else Result := PLongWord(ScanP)^;
+  else
+    Result := PInt64(ScanP)^;
+  end;
+  Inc(ScanP, n);
+end;
+
+function ScanSize: Int64;
+begin
+  Result := ScanInt(AnsiChar(ScanByte));
+end;
+
+procedure ScanValue(AMarker: AnsiChar); forward;
+
+procedure ScanDims(out ACount: Int64);
+var
+  m: AnsiChar;
+  k, i: Int64;
+begin
+  ACount := 1;
+  m := AnsiChar(ScanByte);
+  if m <> '[' then
+  begin
+    ACount := ScanInt(m);
+    Exit;
+  end;
+  m := AnsiChar(ScanP^);
+  if m = '$' then
+  begin
+    Inc(ScanP);
+    m := AnsiChar(ScanByte);
+    if AnsiChar(ScanByte) <> '#' then
+      ScanFail('bad dim vector');
+    k := ScanSize;
+    for i := 1 to k do
+      ACount := ACount * ScanInt(m);
+  end
+  else
+  begin
+    ACount := 1;
+    while AnsiChar(ScanP^) <> ']' do
+      ACount := ACount * ScanSize;
+    Inc(ScanP);
+  end;
+end;
+
+procedure ScanValue(AMarker: AnsiChar);
+var
+  n, i, cnt: Int64;
+  et: AnsiChar;
+begin
+  Inc(ScanNodes);
+  case AMarker of
+    'Z', 'N', 'T', 'F':
+      ;
+    'i', 'U', 'I', 'u', 'l', 'm', 'L', 'M', 'h', 'd', 'D', 'C', 'B':
+      begin
+        n := BJMarkerSize(AMarker);
+        if ScanP + n > ScanE then
+          ScanFail('eof');
+        Inc(ScanP, n);
+      end;
+    'S', 'H':
+      begin
+        n := ScanSize;
+        if ScanP + n > ScanE then
+          ScanFail('eof');
+        Inc(ScanP, n);
+      end;
+    'E':
+      begin
+        ScanSize;
+        n := ScanSize;
+        Inc(ScanP, n);
+      end;
+    '[':
+      begin
+        if AnsiChar(ScanP^) = '$' then
+        begin
+          Inc(ScanP);
+          et := AnsiChar(ScanByte);
+          if AnsiChar(ScanByte) <> '#' then
+            ScanFail('count expected');
+          ScanDims(cnt);
+          Inc(ScanP, cnt * BJMarkerSize(et));
+          Inc(ScanNodes, cnt);
+        end
+        else if AnsiChar(ScanP^) = '#' then
+        begin
+          Inc(ScanP);
+          ScanDims(cnt);
+          for i := 1 to cnt do
+            ScanValue(AnsiChar(ScanByte));
+        end
+        else
+          while AnsiChar(ScanP^) <> ']' do
+            ScanValue(AnsiChar(ScanByte))
+        ;
+        if (ScanP < ScanE) and (AnsiChar(ScanP^) = ']') then
+          Inc(ScanP);
+      end;
+    '{':
+      begin
+        if AnsiChar(ScanP^) = '#' then
+        begin
+          Inc(ScanP);
+          ScanDims(cnt);
+          for i := 1 to cnt do
+          begin
+            n := ScanSize;
+            Inc(ScanP, n);
+            ScanValue(AnsiChar(ScanByte));
+          end;
+        end
+        else
+        begin
+          while AnsiChar(ScanP^) <> '}' do
+          begin
+            n := ScanSize;
+            Inc(ScanP, n);
+            ScanValue(AnsiChar(ScanByte));
+          end;
+          Inc(ScanP);
+        end;
+      end;
+  else
+    ScanFail('marker ' + AMarker);
+  end;
+end;
 
 function LoadFile(const AName: string): TBytes;
 var
@@ -36,7 +222,7 @@ var
   buf, enc: TBytes;
   doc: TBJData;
   i: Integer;
-  t0: TDateTime;
+  t0: Int64;
   best, worst, bestfree, dt: Double;
   mb: Double;
 begin
@@ -51,15 +237,15 @@ begin
   begin
     if doc <> nil then
     begin
-      t0 := Now;
+      t0 := Clock;
       doc.Free;
-      dt := MilliSecondSpan(t0, Now) / 1000.0;
+      dt := (Clock - t0) / 1.0e6;
       if dt < bestfree then
         bestfree := dt;
     end;
-    t0 := Now;
+    t0 := Clock;
     doc := TBJData.ParseBytes(buf);
-    dt := MilliSecondSpan(t0, Now) / 1000.0;
+    dt := (Clock - t0) / 1.0e6;
     if dt < best then
       best := dt;
     if dt > worst then
@@ -67,7 +253,7 @@ begin
   end;
   if DoDecode then
     WriteLn(Format('%-14s %8.2f MB  decode %7.3f s  (%6.1f MB/s)  [free %6.3f s]',
-      [ExtractFileName(AName), mb, best, mb / best, bestfree]));
+      [ExtractFileName(AName), mb, best, Rate(mb, best), bestfree]));
   if not DoEncode then
   begin
     if DoJSON then
@@ -79,28 +265,46 @@ begin
   best := 1.0e30;
   for i := 1 to Repeats do
   begin
-    t0 := Now;
+    t0 := Clock;
     enc := doc.ToBytes([bjwCount, bjwType]);
-    dt := MilliSecondSpan(t0, Now) / 1000.0;
+    dt := (Clock - t0) / 1.0e6;
     if dt < best then
       best := dt;
   end;
   WriteLn(Format('%-14s %8.2f MB  encode %7.3f s  (%6.1f MB/s)  [out %.2f MB]',
-    [' ', mb, best, mb / best, Length(enc) / (1024 * 1024)]));
+    [' ', mb, best, Rate(mb, best), Length(enc) / (1024 * 1024)]));
+
+  if DoScan then
+  begin
+    best := 1.0e30;
+    for i := 1 to Repeats do
+    begin
+      t0 := Clock;
+      ScanP := @buf[0];
+      ScanE := ScanP + Length(buf);
+      ScanNodes := 0;
+      ScanValue(AnsiChar(ScanByte));
+      dt := (Clock - t0) / 1.0e6;
+      if dt < best then
+        best := dt;
+    end;
+    WriteLn(Format('%-14s %8.2f MB  scan   %7.3f s  (%6.1f MB/s)  [%d values]',
+      [' ', mb, best, Rate(mb, best), ScanNodes]));
+  end;
 
   if not Quiet then
   begin
     best := 1.0e30;
     for i := 1 to Repeats do
     begin
-      t0 := Now;
+      t0 := Clock;
       doc.ToJSON(0);
-      dt := MilliSecondSpan(t0, Now) / 1000.0;
+      dt := (Clock - t0) / 1.0e6;
       if dt < best then
         best := dt;
     end;
     WriteLn(Format('%-14s %8.2f MB  tojson %7.3f s  (%6.1f MB/s)',
-      [' ', mb, best, mb / best]));
+      [' ', mb, best, Rate(mb, best)]));
   end;
 
   doc.Free;
@@ -121,6 +325,8 @@ begin
     end
     else if ParamStr(i) = '-q' then
       Quiet := True
+    else if ParamStr(i) = '-s' then
+      DoScan := True
     else if ParamStr(i) = '-d' then
     begin
       DoEncode := False;

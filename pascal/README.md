@@ -135,6 +135,40 @@ Two notes on the numbers:
   well: `doc.Free` on the 24 MB document takes about 26 ms, and the benchmark
   reports it separately rather than hiding it.
 
+### Where the time goes
+
+`bench -s` also walks a document without building anything, which is the byte
+processing floor of the format:
+
+| | tree | structural scan only |
+|---|---|---|
+| 24 MB of GitHub events | 552 MB/s | 2788 MB/s |
+| 0.4 MB catalogue | 207 MB/s | 1093 MB/s |
+
+So roughly a fifth of decoding is reading bytes and four fifths is allocating
+nodes, copying strings and linking the tree. That is worth knowing before
+reaching for wider loads or SIMD: the markers of a BJData stream are already
+self-describing, there is nothing to search for and nothing to un-escape, so
+vectorising the scan can only touch that fifth.
+
+### Use packed arrays
+
+The single biggest performance decision is in the *data*, not the parser. The
+same two million values, stored as a packed array and as individually tagged
+elements:
+
+| | packed `[$type#[...]` | one tag per element | |
+|---|---|---|---|
+| 2 M float64, decode | 0.003 s | 0.060 s | **20x** |
+| 2 M uint16, decode | 0.001 s | 0.062 s | **62x** |
+| 2 M float64, encode | 0.003 s | 0.047 s | **15x** |
+| 2 M uint16, encode | 0.001 s | 0.053 s | **55x** |
+
+A packed array is a length and a memcpy; a tagged sequence is a node per
+element. This is the same effect other binary formats report when they compare
+a typed-array format against one without typed arrays, and it is the reason to
+write numeric data through `NewTypedArray` rather than as a generic array.
+
 What the decoder does to get there, in rough order of what it was worth:
 
 * no `try..except` around each container - a container being filled is pushed
@@ -164,6 +198,7 @@ Building and testing
 make test        # build and run the regression suite
 make tools       # build bjd2json
 make bench BENCHFILES=big.bjd    # time the decoder, the encoder and ToJSON
+build/bench -s -n 9 big.bjd      # add a structural scan with no tree building
 make cross       # additionally cross-check against the python bjdata module
 ```
 
