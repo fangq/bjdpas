@@ -8,6 +8,6 @@
 backup/
 lib/
 build/
-src/test/bjdtest
-src/tools/bjd2json
-src/bjdatapkg.pas
+test/bjdtest
+tools/bjd2json
+bjdatapkg.pas
