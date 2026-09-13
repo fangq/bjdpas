@@ -219,6 +219,42 @@ reaching for wider loads or SIMD: the markers of a BJData stream are already
 self-describing, there is nothing to search for and nothing to un-escape, so
 vectorising the scan can only touch that fifth.
 
+### N-dimensional arrays
+
+An N-d array is an optimized container whose count marker is followed by a
+dimension vector rather than a single number, so the shape travels with the
+data and the payload stays one contiguous block:
+
+```
+[ $ D # [ $ i # i 3  2 3 4 ]   <24 doubles>        row-major
+[ $ D # [ [ $ i # i 3  2 3 4 ] ] <24 doubles>      column-major
+```
+
+```pascal
+vol := TBJData.NewTypedArray('D', [2, 3, 4]);      // or 'l', 'U', 'h', ...
+vol.SetElem(vol.Offset([1, 2, 3]), 42.0);          // subscripts to offset
+vol.ColumnMajor := True;                           // the other layout
+WriteLn(vol.DimCount, 'd ', vol.Dim[0], 'x', vol.Dim[1], 'x', vol.Dim[2]);
+```
+
+`Offset` maps a subscript list to a position in the payload and follows the
+layout flag, so the same indexing code works for either order. Element
+accessors, `ToJSON` and `ExpandTypedArray` all present the array in row-major
+order whichever way it is stored. Through a view the payload can be used where
+it lies:
+
+```pascal
+v := TBJData.View(buf).Find('volume');
+p := PDouble(v.DataPtr);                           // no copy
+WriteLn(p[v.Offset([1, 2, 3])]);
+```
+
+`examples/ndarray.lpr` (`make example`) walks through all of this and prints
+the bytes it produces. A reader here also accepts the dimension vector on a
+plain counted array (`[#[$i#i2 2 3]` followed by individually tagged values),
+which is useful for a mixed-type grid, but the writer never produces it
+because the specification defines the shape only for a uniform element type.
+
 ### Use packed arrays
 
 The single biggest performance decision is in the *data*, not the parser. The
@@ -271,7 +307,7 @@ build/bench -l -k type actor.id big.bjd   # compare the cursor against the tree
 make cross       # additionally cross-check against the python bjdata module
 ```
 
-`test/bjdtest.lpr` holds 150 checks covering the examples of the specification,
+`test/bjdtest.lpr` holds 168 checks covering the examples of the specification,
 round-trips and error handling, including a sweep that parses every prefix and
 every single-byte corruption of a document to confirm that malformed input is
 rejected without crashing or leaking (run the suite with `-gh` to verify the

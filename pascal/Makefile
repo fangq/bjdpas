@@ -3,6 +3,7 @@
 #   make test    build and run the regression suite
 #   make tools   build tools/bjd2json
 #   make bench   time the decoder and the encoder (BENCHFILES=... to pick files)
+#   make example build and run examples/ndarray
 #   make cross   run the interoperability check against the python bjdata module
 #   make clean   remove the build output
 
@@ -11,7 +12,7 @@ FPCFLAGS ?= -Mobjfpc -Sh -O2 -vw
 OUT      ?= build
 PYTHON   ?= python3
 
-.PHONY: all test tools bench cross clean
+.PHONY: all test tools bench example cross clean
 
 all: test tools
 
@@ -27,10 +28,16 @@ $(OUT)/bjd2json: bjdata.pas tools/bjd2json.lpr | $(OUT)
 $(OUT)/bench: bjdata.pas test/bench.lpr | $(OUT)
 	$(FPC) $(FPCFLAGS) -Fu. -FU$(OUT) -FE$(OUT) -o$(OUT)/bench test/bench.lpr
 
+$(OUT)/ndarray: bjdata.pas examples/ndarray.lpr | $(OUT)
+	$(FPC) $(FPCFLAGS) -Fu. -FU$(OUT) -FE$(OUT) -o$(OUT)/ndarray examples/ndarray.lpr
+
 test: $(OUT)/bjdtest
 	$(OUT)/bjdtest
 
 tools: $(OUT)/bjd2json
+
+example: $(OUT)/ndarray
+	$(OUT)/ndarray
 
 bench: $(OUT)/bench
 	$(OUT)/bench -n 5 $(BENCHFILES)

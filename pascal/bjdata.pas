@@ -141,6 +141,7 @@ type
     FImplied: AnsiChar;   // carry no marker of their own)
     function PayloadPtr: PByte; inline;
     function ContainerBody(out AElem: AnsiChar; out ACount: Int64): PByte;
+    function GetDim(AIndex: Integer): Int64;
   public
     class function Create(ABuffer: PByte; ASize: PtrUInt): TBJValue; static;
     class function FromBytes(const ABuffer: TBytes): TBJValue; static;
@@ -175,10 +176,10 @@ type
     function ElemMarker: AnsiChar;
     function ElementCount: Int64;
     function DimCount: Integer;
-    function Dim(AIndex: Integer): Int64;
     function ColumnMajor: Boolean;
     function DataPtr: Pointer;
     function DataSize: PtrUInt;
+    function Offset(const ASubscript: array of Int64): Int64;
     function ElemAsInt64(AIndex: Int64): Int64;
     function ElemAsDouble(AIndex: Int64): Double;
 
@@ -186,6 +187,8 @@ type
     function Size: PtrUInt;
     function ToData(AOptions: TBJDataParseOptions = []): TBJData;
     function ToJSON(AIndent: Integer = 0): string;
+
+    property Dim[AIndex: Integer]: Int64 read GetDim;
   end;
 
   { TBJIterator - walks the children of an array or an object; obtained from
@@ -321,6 +324,7 @@ type
 
     {---- packed array access ----}
     function ElementCount: Int64;
+    function Offset(const ASubscript: array of Int64): Int64;
     function ElemAsDouble(AIndex: Int64): Double;
     function ElemAsInt64(AIndex: Int64): Int64;
     procedure SetElem(AIndex: Int64; const AValue: Double); overload;
@@ -851,7 +855,7 @@ var
     begin
       Inc(APos);
       AColumnMajor := True;
-      Result := ReadVector;
+      Result := ReadVector();
       BJNeed(APos, AEnd, 1);
       if AnsiChar(APos^) = bjmArrayEnd then
         Inc(APos);
@@ -866,7 +870,7 @@ var
       begin
         Inc(APos);
         AColumnMajor := True;
-        Exit(ReadVector);
+        Exit(ReadVector());
       end;
       for i := 1 to k do
       begin
@@ -1981,6 +1985,35 @@ begin
   end;
 end;
 
+{ the position of one element of an N-dimensional array; the subscripts are
+  given in dimension order and the storage layout is taken into account }
+function TBJData.Offset(const ASubscript: array of Int64): Int64;
+var
+  i: Integer;
+  stride: Int64;
+begin
+  if Length(ASubscript) <> Length(FDims) then
+    raise EBJData.CreateFmt('this array has %d dimension(s), not %d',
+      [Length(FDims), Length(ASubscript)]);
+  for i := 0 to High(FDims) do
+    if (ASubscript[i] < 0) or (ASubscript[i] >= FDims[i]) then
+      raise EBJData.CreateFmt('subscript %d is outside 0..%d',
+        [ASubscript[i], FDims[i] - 1]);
+  Result := 0;
+  if FColumnMajor then
+  begin
+    stride := 1;
+    for i := 0 to High(FDims) do
+    begin
+      Result := Result + ASubscript[i] * stride;
+      stride := stride * FDims[i];
+    end;
+  end
+  else
+    for i := 0 to High(FDims) do
+      Result := Result * FDims[i] + ASubscript[i];
+end;
+
 function TBJData.ElemAsDouble(AIndex: Int64): Double;
 var
   p: PByte;
@@ -2093,7 +2126,7 @@ end;
 function TBJData.ExpandTypedArray: TBJData;
 var
   dimidx: array of Int64;
-  offset: Int64;
+  pos: Int64;
 
   function BuildSlice(ALevel: Integer; var AOffset: Int64): TBJData;
   var
@@ -2162,8 +2195,8 @@ begin
   end
   else
   begin
-    offset := 0;
-    Result := BuildSlice(0, offset);
+    pos := 0;
+    Result := BuildSlice(0, pos);
   end;
 end;
 
@@ -5190,7 +5223,7 @@ begin
   BJWalkCount(p, FEnd, dims, Result, colmajor);
 end;
 
-function TBJValue.Dim(AIndex: Integer): Int64;
+function TBJValue.GetDim(AIndex: Integer): Int64;
 var
   dims: TBJDataDims;
   colmajor: Boolean;
@@ -5271,6 +5304,56 @@ begin
   ContainerBody(elem, n);
   if (elem <> #0) and BJIsFixedMarker(elem) and (n > 0) then
     Result := n * BJMarkerSize(elem);
+end;
+
+function TBJValue.Offset(const ASubscript: array of Int64): Int64;
+var
+  dims: TBJDataDims;
+  colmajor: Boolean;
+  p: PByte;
+  elem: AnsiChar;
+  ndim, i: Integer;
+  stride: Int64;
+begin
+  Result := 0;
+  if not IsContainer then
+    raise EBJData.Create('this value is not an array');
+  p := FPos + 1;
+  BJNeed(p, FEnd, 1);
+  if AnsiChar(p^) = bjmTypeMark then
+  begin
+    Inc(p);
+    elem := AnsiChar(p^);
+    Inc(p);
+    if elem = bjmObjectStart then
+      raise EBJData.Create('this value is not an array');
+    Inc(p);
+  end
+  else if AnsiChar(p^) = bjmCountMark then
+    Inc(p)
+  else
+    raise EBJData.Create('this array has no dimensions');
+  SetLength(dims, BJMaxViewDims);
+  BJWalkCount(p, FEnd, dims, ndim, colmajor);
+  if ndim <> Length(ASubscript) then
+    raise EBJData.CreateFmt('this array has %d dimension(s), not %d',
+      [ndim, Length(ASubscript)]);
+  for i := 0 to ndim - 1 do
+    if (ASubscript[i] < 0) or (ASubscript[i] >= dims[i]) then
+      raise EBJData.CreateFmt('subscript %d is outside 0..%d',
+        [ASubscript[i], dims[i] - 1]);
+  if colmajor then
+  begin
+    stride := 1;
+    for i := 0 to ndim - 1 do
+    begin
+      Result := Result + ASubscript[i] * stride;
+      stride := stride * dims[i];
+    end;
+  end
+  else
+    for i := 0 to ndim - 1 do
+      Result := Result * dims[i] + ASubscript[i];
 end;
 
 function TBJValue.ElemAsInt64(AIndex: Int64): Int64;

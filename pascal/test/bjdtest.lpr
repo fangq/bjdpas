@@ -1031,7 +1031,7 @@ begin
   Check(rec.Kind = bjkTypedArray, 'packed array kind');
   Check(rec.ElemMarker = 'D', 'packed element type');
   Check(rec.ElementCount = 6, 'packed element count');
-  Check((rec.DimCount = 2) and (rec.Dim(0) = 2) and (rec.Dim(1) = 3),
+  Check((rec.DimCount = 2) and (rec.Dim[0] = 2) and (rec.Dim[1] = 3),
     'packed dimensions');
   Check(rec.ElemAsDouble(5) = 2.5, 'packed element access');
   Check(rec.DataSize = 48, 'packed payload size');
@@ -1050,6 +1050,49 @@ begin
   finally
     doc.Free;
   end;
+
+  // a column-major N-d array has a nested dimension vector; the cursor has to
+  // measure it correctly to reach whatever follows it
+  doc := TBJData.NewObject;
+  doc.Add('grid', TBJData.NewTypedArray('D', [2, 3, 4]));
+  doc.Values['grid'].ColumnMajor := True;
+  doc.Values['grid'].SetElem(23, 9.5);
+  doc.Add('after', TBJData.NewInt(1234));
+  doc.Add('tail', TBJData.NewString('end'));
+  bytes := doc.ToBytes([bjwCount, bjwType]);
+  doc.Free;
+  v := TBJData.View(bytes);
+  rec := v.Find('grid');
+  Check(rec.DimCount = 3, 'cursor reads a nested dimension vector');
+  Check((rec.Dim[0] = 2) and (rec.Dim[1] = 3) and (rec.Dim[2] = 4),
+    'column-major dimensions through the cursor');
+  Check(rec.ColumnMajor, 'column-major flag through the cursor');
+  Check(rec.ElementCount = 24, 'column-major element count');
+  Check(rec.ElemAsDouble(23) = 9.5, 'column-major element access');
+  Check(rec.ElemAsDouble(rec.Offset([1, 2, 3])) = 9.5, 'subscripts map to the payload');
+  Check(v.Find('after').AsInt64 = 1234,
+    'the cursor steps over a column-major array to the next key');
+  Check(v.Find('tail').TextEquals('end'), 'and to the one after that');
+  CheckCursor(bytes, 'column-major array followed by more keys');
+
+  // the same for a row-major array, and for the subscript mapping
+  doc := TBJData.NewObject;
+  doc.Add('grid', TBJData.NewTypedArray('l', [2, 3, 4]));
+  doc.Values['grid'].SetElem(doc.Values['grid'].Offset([1, 2, 3]), Int64(77));
+  doc.Add('after', TBJData.NewInt(5678));
+  bytes := doc.ToBytes([bjwCount, bjwType]);
+  Check(doc.Values['grid'].Offset([1, 2, 3]) = 23, 'row-major subscript mapping');
+  Check(doc.Values['grid'].Offset([0, 0, 1]) = 1, 'row-major is last index fastest');
+  doc.Values['grid'].ColumnMajor := True;
+  Check(doc.Values['grid'].Offset([0, 0, 1]) = 6,
+    'column-major is first index fastest');
+  Check(doc.Values['grid'].Offset([1, 0, 0]) = 1, 'column-major stride');
+  doc.Free;
+  v := TBJData.View(bytes);
+  Check(v.Find('grid').ElemAsInt64(23) = 77, 'row-major element through the cursor');
+  Check(v.Find('after').AsInt64 = 5678,
+    'the cursor steps over a row-major array to the next key');
+  CheckCursor(bytes, 'row-major array followed by another key');
 
   // spec constructs: packed N-d arrays, extensions, high precision, char
   b := TBuf.Create;
