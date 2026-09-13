@@ -1182,6 +1182,8 @@ begin
             cnt := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
             for i := 1 to cnt do
             begin
+              while (APos < AEnd) and (AnsiChar(APos^) = bjmNoOp) do
+                Inc(APos);
               BJWalkKey(APos, AEnd);
               BJWalkTyped(APos, AEnd, et);
             end;
@@ -1193,6 +1195,8 @@ begin
           cnt := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
           for i := 1 to cnt do
           begin
+            while (APos < AEnd) and (AnsiChar(APos^) = bjmNoOp) do
+              Inc(APos);
             BJWalkKey(APos, AEnd);
             APos := BJSkipValue(APos, AEnd);
           end;
@@ -3302,6 +3306,8 @@ begin
     Result.Reserve(n);
     for i := 0 to n - 1 do
     begin
+      while PeekChar = bjmNoOp do
+        SkipChar;
       idx := Result.AppendSlot;
       ReadKeyInto(Result.FNames[idx]);
       Result.FItems[idx] := ReadScalar(et);
@@ -3316,6 +3322,8 @@ begin
   Result.Reserve(n);
   for i := 0 to n - 1 do
   begin
+    while PeekChar = bjmNoOp do
+      SkipChar;
     idx := Result.AppendSlot;
     ReadKeyInto(Result.FNames[idx]);
     Result.FItems[idx] := ReadValue;
@@ -4943,10 +4951,11 @@ begin
   Result := False;
   if (FLeft = 0) or (FNext = nil) then
     Exit;
-  if FLeft < 0 then
-  begin
+  if FElem = #0 then                  { a no-op never consumes a child slot }
     while (FNext < FEnd) and (AnsiChar(FNext^) = bjmNoOp) do
       Inc(FNext);
+  if FLeft < 0 then
+  begin
     if FNext >= FEnd then
       Exit;
     if FIsObject then

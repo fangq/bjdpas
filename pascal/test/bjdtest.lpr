@@ -857,6 +857,114 @@ begin
   end;
 end;
 
+// a value may be shrunk in place and the freed bytes filled with no-ops,
+// which the decoder has to skip wherever a value or a pair can start
+procedure TestNoOpPadding;
+var
+  doc, back: TBJData;
+  buf: TBytes;
+  i, at: Integer;
+  v: TBJValue;
+  cold: Double;
+
+  function PadAt(const ASource: TBytes): TBytes;
+  var
+    k: Integer;
+  begin
+    Result := Copy(ASource, 0, Length(ASource));
+    for k := 0 to High(Result) - 3 do
+      if (Result[k] = Ord('S')) and (Result[k + 1] = Ord('i')) and
+         (Result[k + 2] = 5) then
+      begin
+        Result[k + 2] := 2;
+        Result[k + 3] := Ord('h');
+        Result[k + 4] := Ord('i');
+        Result[k + 5] := Ord('N');
+        Result[k + 6] := Ord('N');
+        Result[k + 7] := Ord('N');
+        Exit;
+      end;
+  end;
+
+begin
+  WriteLn('in-place editing');
+
+  doc := TBJData.NewObject;
+  doc.Add('temp', TBJData.NewFloat(20.5));
+  doc.Add('name', TBJData.NewString('hello'));
+  doc.Add('n', TBJData.NewInt(7));
+
+  buf := PadAt(doc.ToBytes([]));
+  back := TBJData.ParseBytes(buf);
+  try
+    CheckEq(back.ToJSON(0), '{"temp":20.5,"name":"hi","n":7}',
+      'no-op padding inside an unbounded object');
+  finally
+    back.Free;
+  end;
+
+  buf := PadAt(doc.ToBytes([bjwCount]));
+  back := TBJData.ParseBytes(buf);
+  try
+    CheckEq(back.ToJSON(0), '{"temp":20.5,"name":"hi","n":7}',
+      'no-op padding inside a counted object');
+  finally
+    back.Free;
+  end;
+  CheckEq(TBJData.View(buf).Find('n').AsString, '7',
+    'the cursor steps over no-op padding');
+  doc.Free;
+
+  // and in arrays, counted or not
+  doc := TBJData.NewArray;
+  doc.Add(TBJData.NewString('hello'));
+  doc.Add(TBJData.NewInt(3));
+  buf := PadAt(doc.ToBytes([]));
+  back := TBJData.ParseBytes(buf);
+  try
+    CheckEq(back.ToJSON(0), '["hi",3]', 'no-op padding inside an array');
+  finally
+    back.Free;
+  end;
+  buf := PadAt(doc.ToBytes([bjwCount]));
+  back := TBJData.ParseBytes(buf);
+  try
+    CheckEq(back.ToJSON(0), '["hi",3]', 'no-op padding inside a counted array');
+  finally
+    back.Free;
+  end;
+  Check(TBJData.View(buf).Count = 2, 'padding does not add a child');
+  doc.Free;
+
+  // overwriting a fixed-width value in place keeps the document valid
+  doc := TBJData.NewObject;
+  doc.Add('a', TBJData.NewInt(1));
+  doc.Add('temp', TBJData.NewFloat(20.5));
+  doc.Add('z', TBJData.NewInt(2));
+  buf := doc.ToBytes([bjwCount]);
+  doc.Free;
+  at := -1;
+  for i := 0 to High(buf) - 8 do
+    if buf[i] = Ord('D') then
+    begin
+      at := i + 1;
+      Break;
+    end;
+  Check(at > 0, 'found the float payload');
+  cold := -273.15;
+  PDouble(@buf[at])^ := cold;
+  back := TBJData.ParseBytes(buf);
+  try
+    CheckEq(back.ToJSON(0), '{"a":1,"temp":-273.15,"z":2}',
+      'a fixed-width value can be overwritten in place');
+  finally
+    back.Free;
+  end;
+  v := TBJData.View(buf);
+  Check(v.Find('temp').AsDouble = cold, 'the cursor sees the new value');
+  Check(v.Find('z').AsInt64 = 2, 'the values after it are untouched');
+end;
+
 procedure TestCursor;
 var
   doc, sub: TBJData;
@@ -1024,6 +1132,7 @@ begin
   TestRoundTrip;
   TestEdgeCases;
   TestTruncation;
+  TestNoOpPadding;
   TestCursor;
   WriteLn;
   WriteLn(Format('%d test(s), %d failure(s)', [TestCount, FailCount]));

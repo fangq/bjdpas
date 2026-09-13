@@ -75,6 +75,26 @@ each value instead of reading one that has already been decoded. Reach for the
 tree when a document is small, when it is read repeatedly, or when it has to be
 modified; reach for the cursor when a large file is scanned once.
 
+### Editing a buffer in place
+
+A view is read-only, but the bytes behind it are yours, and BJData is friendly
+to patching:
+
+* **Same size always works.** Every fixed-width value (`i U I u l m L M h d D
+  C B`) can be overwritten with another of the same marker, and every element
+  of a packed array can be overwritten through `DataPtr`, without touching a
+  single byte around it. This is what makes it practical to correct a field in
+  a memory-mapped file that is larger than memory.
+* **Smaller works if the slack is filled with no-ops.** A shorter string can be
+  written over a longer one and the freed bytes set to `N` (0x4E), which a
+  decoder has to skip. This library skips them wherever a value or a pair can
+  begin, including inside counted and typed containers, and the padding does
+  not count towards a container's promised child count. It cannot be used
+  inside a packed `[$type#...]` payload, which has no markers to hide in.
+* **Larger does not work in place.** The value would overrun its neighbour, so
+  everything after it has to move. Rebuild that part of the document instead:
+  `ToData` the subtree, change it, and write it back out.
+
 Two limits worth knowing: a structure-of-arrays record cannot be browsed field
 by field (the cursor reports `IsSoA` and `ToData` materialises it), and
 `DataPtr` hands back the little-endian bytes of the file, so on a big-endian
@@ -251,7 +271,7 @@ build/bench -l -k type actor.id big.bjd   # compare the cursor against the tree
 make cross       # additionally cross-check against the python bjdata module
 ```
 
-`test/bjdtest.lpr` holds 140 checks covering the examples of the specification,
+`test/bjdtest.lpr` holds 150 checks covering the examples of the specification,
 round-trips and error handling, including a sweep that parses every prefix and
 every single-byte corruption of a document to confirm that malformed input is
 rejected without crashing or leaking (run the suite with `-gh` to verify the
