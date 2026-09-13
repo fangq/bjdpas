@@ -55,7 +55,7 @@ var
   body: TBytes;
 begin
   {--- 1. build a 2x3x4 array of float64 -------------------------------}
-  vol := TBJData.NewTypedArray('D', [Nx, Ny, Nz]);
+  vol := TBJData.NewNDArray('D', [Nx, Ny, Nz]);
   for i := 0 to Nx - 1 do
     for j := 0 to Ny - 1 do
       for k := 0 to Nz - 1 do

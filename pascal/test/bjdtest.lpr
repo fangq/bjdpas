@@ -271,7 +271,7 @@ begin
   // the byte array of the spec: [$B#i4 222 173 190 239
   d := ParseHex('5B2442236904DEADBEEF');
   CheckEq(d.ToJSON(0), '[222,173,190,239]', 'packed byte array');
-  Check(d.Kind = bjkTypedArray, 'packed byte array kind');
+  Check(d.Kind = bjkNDArray, 'packed byte array kind');
   Check(Length(d.AsBytes) = 4, 'packed byte array payload');
   d.Free;
 
@@ -301,7 +301,7 @@ begin
 
   // [$U#[$U#i3 2 3 4] : row-major 2x3x4 uint8 array
   d := ParseHex('5B2455235B2455236903020304' + RowData);
-  Check(d.Kind = bjkTypedArray, 'row-major packed array kind');
+  Check(d.Kind = bjkNDArray, 'row-major packed array kind');
   Check((d.DimCount = 3) and (d.Dim[0] = 2) and (d.Dim[1] = 3) and (d.Dim[2] = 4),
     'row-major dimensions');
   Check(not d.ColumnMajor, 'row-major flag');
@@ -327,13 +327,13 @@ begin
   d.Free;
 
   // expansion into a plain nested array
-  d := ParseHex('5B2455235B2455236903020304' + RowData, [bjpExpandTypedArray]);
+  d := ParseHex('5B2455235B2455236903020304' + RowData, [bjpExpandNDArray]);
   Check(d.Kind = bjkArray, 'expanded array kind');
   CheckEq(d.ToJSON(0), Expect, 'expanded array content');
   d.Free;
 
   // a float64 3x2 array built through the API
-  e := TBJData.NewTypedArray('D', [3, 2]);
+  e := TBJData.NewNDArray('D', [3, 2]);
   e.SetElem(0, 1.5);
   e.SetElem(5, -2.25);
   CheckEq(e.ToJSON(0), '[[1.5,0],[0,0],[0,-2.25]]', 'API-built packed array');
@@ -581,7 +581,7 @@ begin
   sub.Add(TBJData.NewInt(1));
   sub.Add(TBJData.NewString('two'));
   sub.Add(TBJData.NewArray);
-  doc.Add('grid', TBJData.NewTypedArray('l', [2, 2]));
+  doc.Add('grid', TBJData.NewNDArray('l', [2, 2]));
   doc.Values['grid'].SetElem(3, Int64(70000));
 
   json := doc.ToJSON(0);
@@ -768,7 +768,7 @@ var
   first: Boolean;
   doc: TBJData;
 begin
-  if AValue.IsSoA or (AValue.IsPacked and (AValue.DimCount > 1)) then
+  if AValue.IsSoA or (AValue.IsNDArray and (AValue.DimCount > 1)) then
   begin
     doc := AValue.ToData;
     try
@@ -805,7 +805,7 @@ begin
           doc.Free;
         end;
       end;
-    bjkArray, bjkTypedArray:
+    bjkArray, bjkNDArray:
       begin
         Result := '[';
         first := True;
@@ -988,7 +988,7 @@ begin
     sub.Add(TBJData.NewInt(i * 100));
   sub := doc.Add('deep', TBJData.NewObject);
   sub.Add('inner', TBJData.NewArray).Add(TBJData.NewString('x'));
-  doc.Add('grid', TBJData.NewTypedArray('D', [2, 3]));
+  doc.Add('grid', TBJData.NewNDArray('D', [2, 3]));
   doc.Values['grid'].SetElem(5, 2.5);
   bytes := doc.ToBytes([bjwCount, bjwType]);
 
@@ -1027,8 +1027,8 @@ begin
   Check(n = 8, 'iterator visited every pair');
 
   rec := v.Find('grid');
-  Check(rec.IsPacked, 'packed array is recognised');
-  Check(rec.Kind = bjkTypedArray, 'packed array kind');
+  Check(rec.IsNDArray, 'packed array is recognised');
+  Check(rec.Kind = bjkNDArray, 'packed array kind');
   Check(rec.ElemMarker = 'D', 'packed element type');
   Check(rec.ElementCount = 6, 'packed element count');
   Check((rec.DimCount = 2) and (rec.Dim[0] = 2) and (rec.Dim[1] = 3),
@@ -1054,7 +1054,7 @@ begin
   // a column-major N-d array has a nested dimension vector; the cursor has to
   // measure it correctly to reach whatever follows it
   doc := TBJData.NewObject;
-  doc.Add('grid', TBJData.NewTypedArray('D', [2, 3, 4]));
+  doc.Add('grid', TBJData.NewNDArray('D', [2, 3, 4]));
   doc.Values['grid'].ColumnMajor := True;
   doc.Values['grid'].SetElem(23, 9.5);
   doc.Add('after', TBJData.NewInt(1234));
@@ -1077,7 +1077,7 @@ begin
 
   // the same for a row-major array, and for the subscript mapping
   doc := TBJData.NewObject;
-  doc.Add('grid', TBJData.NewTypedArray('l', [2, 3, 4]));
+  doc.Add('grid', TBJData.NewNDArray('l', [2, 3, 4]));
   doc.Values['grid'].SetElem(doc.Values['grid'].Offset([1, 2, 3]), Int64(77));
   doc.Add('after', TBJData.NewInt(5678));
   bytes := doc.ToBytes([bjwCount, bjwType]);

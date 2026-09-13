@@ -226,7 +226,7 @@ begin
       SumNum := SumNum + AValue.AsDouble;
     bjkString:
       SumText := SumText + AValue.TextLength;
-    bjkTypedArray:
+    bjkNDArray:
       begin
         { the header is read once, then the payload is addressed directly }
         n := AValue.ElementCount;
@@ -275,7 +275,7 @@ begin
       SumNum := SumNum + ANode.AsDouble;
     bjkString:
       SumText := SumText + Length(ANode.AsString);
-    bjkTypedArray:
+    bjkNDArray:
       for i := 0 to ANode.ElementCount - 1 do
       begin
         Inc(NumValues);

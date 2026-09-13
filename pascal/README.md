@@ -21,7 +21,7 @@ begin
     WriteLn(doc.ToJSON(2));                       // pretty-print as JSON
     WriteLn(doc.Path('subject.age').AsInt64);     // dotted/indexed lookup
 
-    grid := TBJData.NewTypedArray('D', [128, 128, 64]);   // packed 3-d double
+    grid := TBJData.NewNDArray('D', [128, 128, 64]);   // 3-d array of double
     grid.SetElem(0, 3.5);
     doc.Values['volume'] := grid;                 // the tree owns the node
 
@@ -37,7 +37,7 @@ Reading without building a tree
 
 `TBJData.View` returns a `TBJValue`, a cursor over the buffer that allocates
 nothing. Navigating it decodes straight from the bytes, whole subtrees are
-stepped over without being looked at, and strings and packed payloads can be
+stepped over without being looked at, and strings and array payloads can be
 read where they lie. The buffer has to stay alive and unchanged for as long as
 any view of it is used.
 
@@ -56,7 +56,7 @@ end;
 `TBJValue` answers `Kind`, `Marker`, `AsInt64`, `AsDouble`, `AsString`,
 `AsBoolean`, `Count`, `Item`, `Find`, `Path` and `for..in`, plus `TextPtr` /
 `TextLength` / `TextEquals` for comparing strings without copying them and
-`DataPtr` / `DataSize` / `ElemMarker` / `Dim` for addressing a packed array in
+`DataPtr` / `DataSize` / `ElemMarker` / `Dim` for addressing an N-d array in
 place. `ToData` materialises any subtree as a `TBJData` tree when a document
 does need to be held, changed or re-encoded.
 
@@ -64,7 +64,7 @@ When it pays off, measured on the same files as above:
 
 | Workload | cursor | tree | |
 |---|---|---|---|
-| sum 7 M values of packed numeric arrays | 0.016 s | 0.083 s | **5.2x** |
+| sum 7 M values of N-d numeric arrays | 0.016 s | 0.083 s | **5.2x** |
 | pull two fields out of every record of a 24 MB table | 0.021 s | 0.070 s | **3.3x** |
 | touch every one of 634 K values in a 24 MB document | 0.085 s | 0.082 s | 1.0x |
 
@@ -82,7 +82,7 @@ to patching:
 
 * **Same size always works.** Every fixed-width value (`i U I u l m L M h d D
   C B`) can be overwritten with another of the same marker, and every element
-  of a packed array can be overwritten through `DataPtr`, without touching a
+  of an N-d array can be overwritten through `DataPtr`, without touching a
   single byte around it. This is what makes it practical to correct a field in
   a memory-mapped file that is larger than memory.
 * **Smaller works if the slack is filled with no-ops.** A shorter string can be
@@ -90,7 +90,7 @@ to patching:
   decoder has to skip. This library skips them wherever a value or a pair can
   begin, including inside counted and typed containers, and the padding does
   not count towards a container's promised child count. It cannot be used
-  inside a packed `[$type#...]` payload, which has no markers to hide in.
+  inside an `[$type#...]` payload, which has no markers to hide in.
 * **Larger does not work in place.** The value would overrun its neighbour, so
   everything after it has to move. Rebuild that part of the document instead:
   `ToData` the subtree, change it, and write it back out.
@@ -108,7 +108,7 @@ Supported format features
 | `Z N T F i U I u l m L M h d D H C B S` values | yes | yes |
 | Little-endian numerics, IEEE `NaN`/`±Inf` | yes | yes |
 | Unoptimized, count-optimized (`#`) and type-optimized (`$`) containers | yes | yes |
-| Packed N-dimensional arrays, row- **and** column-major | yes | yes |
+| N-dimensional arrays, row- **and** column-major | yes | yes |
 | Structure-of-arrays, row-major (`[$`) and column-major (`{$`) | yes | yes |
 | SoA columns: fixed numeric, `T`, `Z`, fixed strings, dictionary strings, offset-table strings, nested objects, fixed arrays | yes | yes |
 | Extension type `E`, including the reserved ids 1-10 | yes | yes |
@@ -130,7 +130,7 @@ Document model
 | `bjkFloat` | `h`/`d`/`D` | `AsDouble` |
 | `bjkString` | `S`, `C` (char) and `H` (high-precision) | `AsString`, `IsHighPrec` |
 | `bjkArray`, `bjkObject` | child nodes | `Count`, `Items[]`, `Names[]`, `Values[]` |
-| `bjkTypedArray` | a packed numeric payload | `Dim[]`, `DimCount`, `ElemAsDouble`, `ElemAsInt64`, `SetElem`, `AsBytes`, `ExpandTypedArray` |
+| `bjkNDArray` | an N-dimensional numeric payload | `Dim[]`, `DimCount`, `ElemAsDouble`, `ElemAsInt64`, `SetElem`, `AsBytes`, `ExpandNDArray` |
 | `bjkExtension` | a type id and a byte payload | `ExtTypeId`, `ExtPayload`, `AsComplex`, `AsUUIDString`, `AsDateTime` |
 
 A node owns its children; freeing the root frees the tree. `Add`, `Insert` and
@@ -143,7 +143,7 @@ Parsing options
 | Option | Effect |
 |---|---|
 | `bjpKeepNoOp` | keep `N` markers as `bjkNoOp` nodes instead of skipping them |
-| `bjpExpandTypedArray` | decode a packed array into nested plain arrays |
+| `bjpExpandNDArray` | decode an N-d array into nested plain arrays |
 | `bjpSoAAsColumns` | decode a column-major SoA record as an object of columns; by default both SoA layouts decode to an array of records |
 
 Writing options
@@ -169,12 +169,12 @@ Two notes on `bjwSoA`:
   it decoded). Inferring it would be lossy, since `{"x":[1,2,3]}` and a table
   of three records with one `x` field are different documents.
 
-Packed array layout
+N-dimensional array layout
 -------------------
 
-`ColumnMajor` selects how the payload of a `bjkTypedArray` is interpreted and
+`ColumnMajor` selects how the payload of a `bjkNDArray` is interpreted and
 written. Element accessors (`ElemAsDouble`, `SetElem`) always address the
-payload in storage order, while `ToJSON` and `ExpandTypedArray` present the
+payload in storage order, while `ToJSON` and `ExpandNDArray` present the
 array in row-major (C) order for either layout.
 
 Performance
@@ -191,12 +191,12 @@ runs with the file already in memory. The reference is the C extension of
 | | to JSON | 208 MB/s | - |
 | 0.4 MB catalogue (`citm`), deeply nested objects | decode | **188 MB/s** | 110 MB/s |
 | | encode | **376 MB/s** | 107 MB/s |
-| 19 MB of packed numeric arrays | decode | 6.4 GB/s | 28 GB/s |
+| 19 MB of N-d numeric arrays | decode | 6.4 GB/s | 28 GB/s |
 | | encode | 3.2 GB/s | 4.8 GB/s |
 
 Two notes on the numbers:
 
-* On packed arrays pybj is faster because it hands the payload to NumPy as a
+* On N-d arrays pybj is faster because it hands the payload to NumPy as a
   view of the input buffer, while `TBJData` copies it into a node that owns its
   memory and outlives the buffer. Both are then bound by memory bandwidth.
 * Decoding builds a full document tree, so releasing it costs real time as
@@ -231,7 +231,7 @@ data and the payload stays one contiguous block:
 ```
 
 ```pascal
-vol := TBJData.NewTypedArray('D', [2, 3, 4]);      // or 'l', 'U', 'h', ...
+vol := TBJData.NewNDArray('D', [2, 3, 4]);      // or 'l', 'U', 'h', ...
 vol.SetElem(vol.Offset([1, 2, 3]), 42.0);          // subscripts to offset
 vol.ColumnMajor := True;                           // the other layout
 WriteLn(vol.DimCount, 'd ', vol.Dim[0], 'x', vol.Dim[1], 'x', vol.Dim[2]);
@@ -239,7 +239,7 @@ WriteLn(vol.DimCount, 'd ', vol.Dim[0], 'x', vol.Dim[1], 'x', vol.Dim[2]);
 
 `Offset` maps a subscript list to a position in the payload and follows the
 layout flag, so the same indexing code works for either order. Element
-accessors, `ToJSON` and `ExpandTypedArray` all present the array in row-major
+accessors, `ToJSON` and `ExpandNDArray` all present the array in row-major
 order whichever way it is stored. Through a view the payload can be used where
 it lies:
 
@@ -255,23 +255,23 @@ plain counted array (`[#[$i#i2 2 3]` followed by individually tagged values),
 which is useful for a mixed-type grid, but the writer never produces it
 because the specification defines the shape only for a uniform element type.
 
-### Use packed arrays
+### Use N-dimensional arrays
 
 The single biggest performance decision is in the *data*, not the parser. The
-same two million values, stored as a packed array and as individually tagged
+same two million values, stored as an N-d array and as individually tagged
 elements:
 
-| | packed `[$type#[...]` | one tag per element | |
+| | N-d `[$type#[...]` | one tag per element | |
 |---|---|---|---|
 | 2 M float64, decode | 0.003 s | 0.060 s | **20x** |
 | 2 M uint16, decode | 0.001 s | 0.062 s | **62x** |
 | 2 M float64, encode | 0.003 s | 0.047 s | **15x** |
 | 2 M uint16, encode | 0.001 s | 0.053 s | **55x** |
 
-A packed array is a length and a memcpy; a tagged sequence is a node per
+An N-d array is a length and a memcpy; a tagged sequence is a node per
 element. This is the same effect other binary formats report when they compare
 a typed-array format against one without typed arrays, and it is the reason to
-write numeric data through `NewTypedArray` rather than as a generic array.
+write numeric data through `NewNDArray` rather than as a generic array.
 
 What the decoder does to get there, in rough order of what it was worth:
 
@@ -329,14 +329,14 @@ Interoperability
 
 The output has been verified against the reference implementations:
 
-* **pybj 0.6.0** - all values, packed row-major N-d arrays and byte arrays
+* **pybj 0.6.0** - all values, row-major N-d arrays and byte arrays
   round-trip in both directions.
 * **nlohmann/json (BJData Draft-4 branch)** - flat SoA records in both layouts,
   including dictionary, offset-table and fixed-width string columns, decode
   identically.
 
 Two constructs of the specification are not understood by those two libraries
-today, so they are only emitted on request: column-major packed N-d arrays
+today, so they are only emitted on request: column-major N-d arrays
 (written only when `ColumnMajor` is set) and SoA schemas containing nested
 objects or arrays (written only when the data requires them).
 

@@ -96,13 +96,13 @@ type
     bjkString,      // S, C (single char) and H (high-precision number)
     bjkArray,       // [ ... ]
     bjkObject,      // { ... }
-    bjkTypedArray,  // [$type#[dims] packed N-dimensional numeric array
+    bjkNDArray,     // [$type#[dims] N-dimensional array of one numeric type
     bjkExtension    // E
   );
 
   TBJDataParseOption = (
     bjpKeepNoOp,          // keep 'N' markers as bjkNoOp nodes instead of skipping
-    bjpExpandTypedArray,  // decode [$type#count] into a plain array of scalars
+    bjpExpandNDArray,  // decode [$type#count] into a plain array of scalars
     bjpSoAAsColumns       // decode a '{$' SoA record as an object of arrays
   );                      // (default: always an array of objects)
   TBJDataParseOptions = set of TBJDataParseOption;
@@ -129,7 +129,7 @@ type
   { TBJValue - a read-only view of one value inside a buffer.
 
     Navigating a document through TBJValue allocates nothing: every call
-    decodes straight from the bytes, strings and packed payloads can be read
+    decodes straight from the bytes, strings and array payloads can be read
     without copying them, and a subtree becomes a TBJData tree only when
     ToData is called. The buffer must stay alive and unchanged for as long as
     any view of it is used. }
@@ -152,7 +152,7 @@ type
     function IsNull: Boolean;
     function IsNumber: Boolean;
     function IsContainer: Boolean;
-    function IsPacked: Boolean;
+    function IsNDArray: Boolean;
     function IsSoA: Boolean;
 
     {---- scalars ----}
@@ -172,7 +172,7 @@ type
     function FindKey(AKey: PAnsiChar; ALength: SizeInt): TBJValue;
     function Path(const APath: string): TBJValue;
 
-    {---- packed arrays ----}
+    {---- N-dimensional arrays ----}
     function ElemMarker: AnsiChar;
     function ElementCount: Int64;
     function DimCount: Integer;
@@ -227,9 +227,9 @@ type
     FInt: Int64;            // integer/unsigned/boolean payload
     FFloat: Double;         // floating-point payload
     FStr: string;           // string/char/high-precision payload
-    FBin: TBytes;           // packed array payload or extension payload
-    FDims: TBJDataDims;     // dimensions of a packed array or SoA record
-    FColumnMajor: Boolean;  // packed payload is in column-major order
+    FBin: TBytes;           // N-d array payload or extension payload
+    FDims: TBJDataDims;     // dimensions of an N-d array or SoA record
+    FColumnMajor: Boolean;  // the payload is in column-major order
     FFromSoA: Boolean;      // array/object was decoded from an SoA record
     FItems: TBJDataItems;   // child nodes (array and object)
     FNames: TBJDataNames;   // child names (object only)
@@ -279,7 +279,7 @@ type
     class function NewHighPrec(const AValue: string): TBJData;
     class function NewArray: TBJData;
     class function NewObject: TBJData;
-    class function NewTypedArray(AMarker: AnsiChar; const ADims: array of Int64): TBJData;
+    class function NewNDArray(AMarker: AnsiChar; const ADims: array of Int64): TBJData;
     class function NewBytes(const AValue: TBytes): TBJData;
     class function NewExtension(ATypeId: Int64; const APayload: TBytes): TBJData;
     class function NewComplex(ARe, AIm: Double; ASingle: Boolean = False): TBJData;
@@ -322,7 +322,7 @@ type
     function Clone: TBJData;
     function Path(const APath: string): TBJData;
 
-    {---- packed array access ----}
+    {---- N-dimensional array access ----}
     function ElementCount: Int64;
     function Offset(const ASubscript: array of Int64): Int64;
     function ElemAsDouble(AIndex: Int64): Double;
@@ -330,7 +330,7 @@ type
     procedure SetElem(AIndex: Int64; const AValue: Double); overload;
     procedure SetElem(AIndex: Int64; const AValue: Int64); overload;
     procedure SetDims(const ADims: array of Int64);
-    function ExpandTypedArray: TBJData;
+    function ExpandNDArray: TBJData;
     function AsBytes: TBytes;
 
     {---- extension helpers ----}
@@ -594,7 +594,7 @@ begin
     bjkString:     Result := 'string';
     bjkArray:      Result := 'array';
     bjkObject:     Result := 'object';
-    bjkTypedArray: Result := 'packed array';
+    bjkNDArray: Result := 'N-d array';
     bjkExtension:  Result := 'extension';
   else
     Result := 'unknown';
@@ -1247,7 +1247,7 @@ begin
     bjkString:     FMarker := bjmString;
     bjkArray:      FMarker := bjmArrayStart;
     bjkObject:     FMarker := bjmObjectStart;
-    bjkTypedArray: FMarker := bjmUInt8;
+    bjkNDArray: FMarker := bjmUInt8;
     bjkExtension:  FMarker := bjmExtension;
   end;
 end;
@@ -1386,15 +1386,15 @@ begin
   Result := TBJData.Create(bjkObject);
 end;
 
-class function TBJData.NewTypedArray(AMarker: AnsiChar;
+class function TBJData.NewNDArray(AMarker: AnsiChar;
   const ADims: array of Int64): TBJData;
 var
   i: Integer;
   n: Int64;
 begin
   if not BJIsFixedMarker(AMarker) then
-    raise EBJData.CreateFmt('"%s" cannot be used as a packed array type', [AMarker]);
-  Result := TBJData.Create(bjkTypedArray);
+    raise EBJData.CreateFmt('"%s" cannot be used as an N-d array type', [AMarker]);
+  Result := TBJData.Create(bjkNDArray);
   Result.FMarker := AMarker;
   SetLength(Result.FDims, Length(ADims));
   n := 1;
@@ -1412,7 +1412,7 @@ end;
 
 class function TBJData.NewBytes(const AValue: TBytes): TBJData;
 begin
-  Result := TBJData.Create(bjkTypedArray);
+  Result := TBJData.Create(bjkNDArray);
   Result.FMarker := bjmByte;
   SetLength(Result.FDims, 1);
   Result.FDims[0] := Length(AValue);
@@ -1921,7 +1921,7 @@ end;
 
 function TBJData.IsContainer: Boolean;
 begin
-  Result := FKind in [bjkArray, bjkObject, bjkTypedArray];
+  Result := FKind in [bjkArray, bjkObject, bjkNDArray];
 end;
 
 function TBJData.IsNumber: Boolean;
@@ -1935,7 +1935,7 @@ begin
 end;
 
 {==============================================================================
-  TBJData - packed (N-dimensional) array access
+  TBJData - N-dimensional array access
 ==============================================================================}
 
 function TBJData.GetDimCount: SizeInt;
@@ -1958,7 +1958,7 @@ begin
   n := 1;
   for i := 0 to High(ADims) do
     n := n * ADims[i];
-  if (FKind = bjkTypedArray) and (n <> ElementCount) then
+  if (FKind = bjkNDArray) and (n <> ElementCount) then
     raise EBJData.Create('the new dimensions do not match the element count');
   SetLength(FDims, Length(ADims));
   for i := 0 to High(ADims) do
@@ -1970,7 +1970,7 @@ var
   i: Integer;
 begin
   case FKind of
-    bjkTypedArray:
+    bjkNDArray:
       begin
         if Length(FDims) = 0 then
           Exit(0);
@@ -2022,7 +2022,7 @@ var
   f: Single;
   d: Double;
 begin
-  NeedKind(bjkTypedArray, 'element access');
+  NeedKind(bjkNDArray, 'element access');
   sz := BJMarkerSize(FMarker);
   if (AIndex < 0) or ((AIndex + 1) * sz > Length(FBin)) then
     raise EBJData.CreateFmt('element index %d is out of range', [AIndex]);
@@ -2055,7 +2055,7 @@ var
   p: PByte;
   sz: Integer;
 begin
-  NeedKind(bjkTypedArray, 'element access');
+  NeedKind(bjkNDArray, 'element access');
   sz := BJMarkerSize(FMarker);
   if (AIndex < 0) or ((AIndex + 1) * sz > Length(FBin)) then
     raise EBJData.CreateFmt('element index %d is out of range', [AIndex]);
@@ -2081,7 +2081,7 @@ var
   w: Word;
   f: Single;
 begin
-  NeedKind(bjkTypedArray, 'element access');
+  NeedKind(bjkNDArray, 'element access');
   sz := BJMarkerSize(FMarker);
   if (AIndex < 0) or ((AIndex + 1) * sz > Length(FBin)) then
     raise EBJData.CreateFmt('element index %d is out of range', [AIndex]);
@@ -2109,7 +2109,7 @@ var
   p: PByte;
   sz: Integer;
 begin
-  NeedKind(bjkTypedArray, 'element access');
+  NeedKind(bjkNDArray, 'element access');
   sz := BJMarkerSize(FMarker);
   if (AIndex < 0) or ((AIndex + 1) * sz > Length(FBin)) then
     raise EBJData.CreateFmt('element index %d is out of range', [AIndex]);
@@ -2123,7 +2123,7 @@ begin
   end;
 end;
 
-function TBJData.ExpandTypedArray: TBJData;
+function TBJData.ExpandNDArray: TBJData;
 var
   dimidx: array of Int64;
   pos: Int64;
@@ -2185,7 +2185,7 @@ var
   end;
 
 begin
-  NeedKind(bjkTypedArray, 'expansion');
+  NeedKind(bjkNDArray, 'expansion');
   if Length(FDims) = 0 then
     Exit(TBJData.NewArray);
   if FColumnMajor then
@@ -2206,7 +2206,7 @@ var
 begin
   Result := nil;
   case FKind of
-    bjkTypedArray, bjkExtension:
+    bjkNDArray, bjkExtension:
       Result := Copy(FBin, 0, Length(FBin));
     bjkString:
       begin
@@ -2339,7 +2339,7 @@ var
 
   procedure Dump(ANode: TBJData; ALevel: Integer);
 
-    procedure DumpPacked(ALocal: TBJData; ALocalLevel: Integer);
+    procedure DumpNDArray(ALocal: TBJData; ALocalLevel: Integer);
     var
       pos: Int64;
       tmp: TBJData;
@@ -2382,7 +2382,7 @@ var
       end;
       if ALocal.FColumnMajor then
       begin
-        tmp := ALocal.ExpandTypedArray;
+        tmp := ALocal.ExpandNDArray;
         try
           Dump(tmp, ALocalLevel);
         finally
@@ -2452,8 +2452,8 @@ var
             sb.Append(BJJSONEscape(ANode.FStr));
           sb.Append('"');
         end;
-      bjkTypedArray:
-        DumpPacked(ANode, ALevel);
+      bjkNDArray:
+        DumpNDArray(ANode, ALevel);
       bjkExtension:
         DumpExtension(ANode);
       bjkArray:
@@ -2670,7 +2670,7 @@ type
     function ReadDimArray(out ADims: TBJDataDims): Boolean;
     procedure ReadCountSpec(out ADims: TBJDataDims; out AColumnMajor: Boolean);
     function ReadScalar(AMarker: AnsiChar): TBJData;
-    function ReadPacked(AMarker: AnsiChar; const ADims: TBJDataDims;
+    function ReadNDArray(AMarker: AnsiChar; const ADims: TBJDataDims;
       AColumnMajor: Boolean): TBJData;
     function ReadArrayNode: TBJData;
     function ReadArrayOptimized: TBJData;
@@ -3184,7 +3184,7 @@ begin
   Result := ReadScalar(m);
 end;
 
-function TBJReader.ReadPacked(AMarker: AnsiChar; const ADims: TBJDataDims;
+function TBJReader.ReadNDArray(AMarker: AnsiChar; const ADims: TBJDataDims;
   AColumnMajor: Boolean): TBJData;
 var
   n, nbytes: Int64;
@@ -3195,7 +3195,7 @@ begin
   n := BJDimProduct(ADims);
   nbytes := n * sz;
   Need(nbytes);
-  Result := TBJData.NewFast(bjkTypedArray, AMarker);
+  Result := TBJData.NewFast(bjkNDArray, AMarker);
   Result.FDims := Copy(ADims, 0, Length(ADims));
   Result.FColumnMajor := AColumnMajor;
   SetLength(Result.FBin, nbytes);
@@ -3205,11 +3205,11 @@ begin
     BJFromLE(@Result.FBin[0], sz, n);
     Inc(FCur, nbytes);
   end;
-  if bjpExpandTypedArray in FOptions then
+  if bjpExpandNDArray in FOptions then
   begin
     tmp := Result;
     try
-      Result := tmp.ExpandTypedArray;
+      Result := tmp.ExpandNDArray;
     finally
       tmp.Free;
     end;
@@ -3259,7 +3259,7 @@ begin
     Expect(bjmCountMark);
     ReadCountSpec(dims, colmajor);
     if BJIsFixedMarker(et) then
-      Exit(ReadPacked(et, dims, colmajor));
+      Exit(ReadNDArray(et, dims, colmajor));
     { lenient: a non-fixed optimized type (allowed by UBJSON, not by BJData) }
     n := BJDimProduct(dims);
     Result := TBJData.NewFast(bjkArray, bjmArrayStart);
@@ -3836,7 +3836,7 @@ type
     procedure WText(const AValue: string);
     procedure WDims(const ADims: TBJDataDims);
     procedure WPayload(AMarker: AnsiChar; ANode: TBJData);
-    procedure WPacked(ANode: TBJData);
+    procedure WNDArray(ANode: TBJData);
     procedure WArray(ANode: TBJData);
     procedure WObject(ANode: TBJData);
     function TryWriteSoA(ANode: TBJData): Boolean;
@@ -4024,7 +4024,7 @@ begin
     WIntAs(AMarker, ANode.AsInt64);
 end;
 
-procedure TBJWriter.WPacked(ANode: TBJData);
+procedure TBJWriter.WNDArray(ANode: TBJData);
 var
   n: Int64;
 {$IFDEF ENDIAN_BIG}
@@ -4176,8 +4176,8 @@ begin
           WText(ANode.FStr);
         end;
       end;
-    bjkTypedArray:
-      WPacked(ANode);
+    bjkNDArray:
+      WNDArray(ANode);
     bjkExtension:
       begin
         WChar(bjmExtension);
@@ -4734,8 +4734,8 @@ end;
 
 function TBJValue.Kind: TBJDataKind;
 begin
-  if IsPacked then
-    Result := bjkTypedArray
+  if IsNDArray then
+    Result := bjkNDArray
   else
     Result := BJKindOf(Marker);
 end;
@@ -4756,7 +4756,7 @@ begin
             (AnsiChar(FPos^) in [bjmArrayStart, bjmObjectStart]);
 end;
 
-function TBJValue.IsPacked: Boolean;
+function TBJValue.IsNDArray: Boolean;
 begin
   Result := False;
   if (FImplied <> #0) or not IsValid or (AnsiChar(FPos^) <> bjmArrayStart) then
@@ -5059,7 +5059,7 @@ var
   n: Int64;
   it: TBJIterator;
 begin
-  if IsPacked then
+  if IsNDArray then
     Exit(ElementCount);
   ContainerBody(elem, n);
   if n >= 0 then
@@ -5284,7 +5284,7 @@ begin
   BJWalkCount(p, FEnd, dims, ndim, Result);
 end;
 
-{ the packed payload, in the little-endian order of the file }
+{ the array payload, in the little-endian order of the file }
 function TBJValue.DataPtr: Pointer;
 var
   elem: AnsiChar;

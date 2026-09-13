@@ -57,7 +57,7 @@ begin
       indent := StrToIntDef(ParamStr(i), 0);
     end
     else if arg = '-x' then
-      Include(popt, bjpExpandTypedArray)
+      Include(popt, bjpExpandNDArray)
     else if arg = '-k' then
       Include(popt, bjpKeepNoOp)
     else if arg = '-c' then
