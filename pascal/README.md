@@ -32,6 +32,54 @@ begin
 end;
 ```
 
+Reading without building a tree
+-------------------------------
+
+`TBJData.View` returns a `TBJValue`, a cursor over the buffer that allocates
+nothing. Navigating it decodes straight from the bytes, whole subtrees are
+stepped over without being looked at, and strings and packed payloads can be
+read where they lie. The buffer has to stay alive and unchanged for as long as
+any view of it is used.
+
+```pascal
+var
+  buf: TBytes;
+  root, rec: TBJValue;
+begin
+  buf := ReadWholeFile('events.bjd');
+  for rec in TBJData.View(buf) do                  // no allocation per record
+    if rec.Find('type').TextEquals('PushEvent') then
+      WriteLn(rec.Path('actor.id').AsInt64);
+end;
+```
+
+`TBJValue` answers `Kind`, `Marker`, `AsInt64`, `AsDouble`, `AsString`,
+`AsBoolean`, `Count`, `Item`, `Find`, `Path` and `for..in`, plus `TextPtr` /
+`TextLength` / `TextEquals` for comparing strings without copying them and
+`DataPtr` / `DataSize` / `ElemMarker` / `Dim` for addressing a packed array in
+place. `ToData` materialises any subtree as a `TBJData` tree when a document
+does need to be held, changed or re-encoded.
+
+When it pays off, measured on the same files as above:
+
+| Workload | cursor | tree | |
+|---|---|---|---|
+| sum 7 M values of packed numeric arrays | 0.016 s | 0.083 s | **5.2x** |
+| pull two fields out of every record of a 24 MB table | 0.021 s | 0.070 s | **3.3x** |
+| touch every one of 634 K values in a 24 MB document | 0.085 s | 0.082 s | 1.0x |
+
+The pattern is the one lazy parsers always have: a cursor wins by *not* doing
+work, so it wins when a document is bigger than the part of it that is needed,
+and it draws level when every value is read anyway, because it then decodes
+each value instead of reading one that has already been decoded. Reach for the
+tree when a document is small, when it is read repeatedly, or when it has to be
+modified; reach for the cursor when a large file is scanned once.
+
+Two limits worth knowing: a structure-of-arrays record cannot be browsed field
+by field (the cursor reports `IsSoA` and `ToData` materialises it), and
+`DataPtr` hands back the little-endian bytes of the file, so on a big-endian
+host use `ElemAsInt64` / `ElemAsDouble` instead.
+
 Supported format features
 -------------------------
 
@@ -199,10 +247,11 @@ make test        # build and run the regression suite
 make tools       # build bjd2json
 make bench BENCHFILES=big.bjd    # time the decoder, the encoder and ToJSON
 build/bench -s -n 9 big.bjd      # add a structural scan with no tree building
+build/bench -l -k type actor.id big.bjd   # compare the cursor against the tree
 make cross       # additionally cross-check against the python bjdata module
 ```
 
-`test/bjdtest.lpr` holds 98 checks covering the examples of the specification,
+`test/bjdtest.lpr` holds 140 checks covering the examples of the specification,
 round-trips and error handling, including a sweep that parses every prefix and
 every single-byte corruption of a document to confirm that malformed input is
 rejected without crashing or leaking (run the suite with `-gh` to verify the

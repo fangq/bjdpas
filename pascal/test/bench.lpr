@@ -41,6 +41,9 @@ var
   DoEncode: Boolean = True;
   DoJSON: Boolean = True;
   DoScan: Boolean = False;
+  DoLazy: Boolean = False;
+  KeyA: string = '';
+  KeyB: string = '';
 
 { walk the document without building anything: this is the byte-processing
   floor of the format, i.e. what is left to gain if node construction were
@@ -202,6 +205,127 @@ begin
   end;
 end;
 
+{---- workload A: visit every value in the document ----}
+
+var
+  SumNum: Double;
+  SumText: Int64;
+  NumValues: Int64;
+
+procedure VisitView(const AValue: TBJValue);
+var
+  it: TBJIterator;
+  n, i: Int64;
+  sz: Integer;
+  p: PByte;
+  em: AnsiChar;
+begin
+  Inc(NumValues);
+  case AValue.Kind of
+    bjkInt, bjkUInt, bjkFloat:
+      SumNum := SumNum + AValue.AsDouble;
+    bjkString:
+      SumText := SumText + AValue.TextLength;
+    bjkTypedArray:
+      begin
+        { the header is read once, then the payload is addressed directly }
+        n := AValue.ElementCount;
+        p := AValue.DataPtr;
+        em := AValue.ElemMarker;
+        sz := BJMarkerSize(em);
+        for i := 0 to n - 1 do
+        begin
+          Inc(NumValues);
+          if em = 'D' then
+            SumNum := SumNum + PDouble(p + i * sz)^
+          else if em = 'd' then
+            SumNum := SumNum + PSingle(p + i * sz)^
+          else if sz = 1 then
+            SumNum := SumNum + PByte(p + i * sz)^
+          else if sz = 2 then
+            SumNum := SumNum + PWord(p + i * sz)^
+          else if sz = 4 then
+            SumNum := SumNum + PLongWord(p + i * sz)^
+          else
+            SumNum := SumNum + PInt64(p + i * sz)^;
+        end;
+      end;
+    bjkArray, bjkObject:
+      begin
+        if AValue.IsSoA then
+          Exit;
+        it := AValue.GetEnumerator;
+        while it.MoveNext do
+        begin
+          if it.KeyLength > 0 then
+            SumText := SumText + it.KeyLength;
+          VisitView(it.Current);
+        end;
+      end;
+  end;
+end;
+
+procedure VisitData(ANode: TBJData);
+var
+  i: SizeInt;
+begin
+  Inc(NumValues);
+  case ANode.Kind of
+    bjkInt, bjkUInt, bjkFloat:
+      SumNum := SumNum + ANode.AsDouble;
+    bjkString:
+      SumText := SumText + Length(ANode.AsString);
+    bjkTypedArray:
+      for i := 0 to ANode.ElementCount - 1 do
+      begin
+        Inc(NumValues);
+        SumNum := SumNum + ANode.ElemAsDouble(i);
+      end;
+    bjkArray, bjkObject:
+      for i := 0 to ANode.Count - 1 do
+      begin
+        if ANode.Kind = bjkObject then
+          SumText := SumText + Length(ANode.Names[i]);
+        VisitData(ANode.Items[i]);
+      end;
+  end;
+end;
+
+{---- workload B: pull two fields out of each record of a table ----}
+
+function ExtractView(const ARoot: TBJValue; const AKeyA, AKeyB: string): Int64;
+var
+  rec, v: TBJValue;
+begin
+  Result := 0;
+  for rec in ARoot do
+  begin
+    v := rec.Find(AKeyA);
+    if v.IsValid then
+      Result := Result + v.TextLength;
+    v := rec.Path(AKeyB);
+    if v.IsValid then
+      Result := Result + v.AsInt64;
+  end;
+end;
+
+function ExtractData(ARoot: TBJData; const AKeyA, AKeyB: string): Int64;
+var
+  i: SizeInt;
+  v: TBJData;
+begin
+  Result := 0;
+  for i := 0 to ARoot.Count - 1 do
+  begin
+    v := ARoot.Items[i].Values[AKeyA];
+    if v <> nil then
+      Result := Result + Length(v.AsString);
+    v := ARoot.Items[i].Path(AKeyB);
+    if v <> nil then
+      Result := Result + v.AsInt64;
+  end;
+end;
+
 function LoadFile(const AName: string): TBytes;
 var
   fs: TFileStream;
@@ -225,6 +349,7 @@ var
   t0: Int64;
   best, worst, bestfree, dt: Double;
   mb: Double;
+  n64: Int64;
 begin
   buf := LoadFile(AName);
   mb := Length(buf) / (1024 * 1024);
@@ -292,6 +417,74 @@ begin
       [' ', mb, best, Rate(mb, best), ScanNodes]));
   end;
 
+  if DoLazy then
+  begin
+    { visit every value, once through a view and once through a tree }
+    best := 1.0e30;
+    for i := 1 to Repeats do
+    begin
+      t0 := Clock;
+      SumNum := 0;
+      SumText := 0;
+      NumValues := 0;
+      VisitView(TBJValue.FromBytes(buf));
+      dt := (Clock - t0) / 1.0e6;
+      if dt < best then
+        best := dt;
+    end;
+    WriteLn(Format('%-14s %8.2f MB  walk   %7.3f s  (%6.1f MB/s)  view, %d values',
+      [' ', mb, best, Rate(mb, best), NumValues]));
+
+    best := 1.0e30;
+    for i := 1 to Repeats do
+    begin
+      t0 := Clock;
+      SumNum := 0;
+      SumText := 0;
+      NumValues := 0;
+      doc := TBJData.ParseBytes(buf);
+      VisitData(doc);
+      doc.Free;
+      dt := (Clock - t0) / 1.0e6;
+      if dt < best then
+        best := dt;
+    end;
+    doc := nil;
+    WriteLn(Format('%-14s %8.2f MB  walk   %7.3f s  (%6.1f MB/s)  tree, %d values',
+      [' ', mb, best, Rate(mb, best), NumValues]));
+
+    { pull two fields out of every record, when the document is a table }
+    if (KeyA <> '') and (TBJValue.FromBytes(buf).Kind = bjkArray) then
+    begin
+      best := 1.0e30;
+      for i := 1 to Repeats do
+      begin
+        t0 := Clock;
+        n64 := ExtractView(TBJValue.FromBytes(buf), KeyA, KeyB);
+        dt := (Clock - t0) / 1.0e6;
+        if dt < best then
+          best := dt;
+      end;
+      WriteLn(Format('%-14s %8.2f MB  pick   %7.3f s  (%6.1f MB/s)  view, sum %d',
+        [' ', mb, best, Rate(mb, best), n64]));
+
+      best := 1.0e30;
+      for i := 1 to Repeats do
+      begin
+        t0 := Clock;
+        doc := TBJData.ParseBytes(buf);
+        n64 := ExtractData(doc, KeyA, KeyB);
+        doc.Free;
+        dt := (Clock - t0) / 1.0e6;
+        if dt < best then
+          best := dt;
+      end;
+      doc := nil;
+      WriteLn(Format('%-14s %8.2f MB  pick   %7.3f s  (%6.1f MB/s)  tree, sum %d',
+        [' ', mb, best, Rate(mb, best), n64]));
+    end;
+  end;
+
   if not Quiet then
   begin
     best := 1.0e30;
@@ -327,6 +520,15 @@ begin
       Quiet := True
     else if ParamStr(i) = '-s' then
       DoScan := True
+    else if ParamStr(i) = '-l' then
+      DoLazy := True
+    else if ParamStr(i) = '-k' then
+    begin
+      Inc(i);
+      KeyA := ParamStr(i);
+      Inc(i);
+      KeyB := ParamStr(i);
+    end
     else if ParamStr(i) = '-d' then
     begin
       DoEncode := False;

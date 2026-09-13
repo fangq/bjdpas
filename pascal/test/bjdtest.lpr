@@ -759,6 +759,259 @@ begin
   Check(raised > 0, Format('%d corrupted documents were rejected', [raised]));
 end;
 
+// render a document using only the lazy cursor; the result must match what
+// the tree produces, which exercises skipping and iteration over every
+// construct the format has
+function CursorJSON(const AValue: TBJValue): string;
+var
+  it: TBJIterator;
+  first: Boolean;
+  doc: TBJData;
+begin
+  if AValue.IsSoA or (AValue.IsPacked and (AValue.DimCount > 1)) then
+  begin
+    doc := AValue.ToData;
+    try
+      Exit(doc.ToJSON(0));
+    finally
+      doc.Free;
+    end;
+  end;
+  case AValue.Kind of
+    bjkNull, bjkNoOp:
+      Result := 'null';
+    bjkBoolean:
+      if AValue.AsBoolean then
+        Result := 'true'
+      else
+        Result := 'false';
+    bjkInt:
+      Result := IntToStr(AValue.AsInt64);
+    bjkUInt:
+      Result := UIntToStr(AValue.AsQWord);
+    bjkFloat:
+      Result := BJFloatToStr(AValue.AsDouble);
+    bjkString:
+      if AValue.Marker = 'H' then
+        Result := AValue.AsString
+      else
+        Result := '"' + BJJSONEscape(AValue.AsString) + '"';
+    bjkExtension:
+      begin
+        doc := AValue.ToData;
+        try
+          Result := doc.ToJSON(0);
+        finally
+          doc.Free;
+        end;
+      end;
+    bjkArray, bjkTypedArray:
+      begin
+        Result := '[';
+        first := True;
+        it := AValue.GetEnumerator;
+        while it.MoveNext do
+        begin
+          if not first then
+            Result := Result + ',';
+          Result := Result + CursorJSON(it.Current);
+          first := False;
+        end;
+        Result := Result + ']';
+      end;
+    bjkObject:
+      begin
+        Result := '{';
+        first := True;
+        it := AValue.GetEnumerator;
+        while it.MoveNext do
+        begin
+          if not first then
+            Result := Result + ',';
+          Result := Result + '"' + BJJSONEscape(it.Key) + '":' +
+            CursorJSON(it.Current);
+          first := False;
+        end;
+        Result := Result + '}';
+      end;
+  end;
+end;
+
+procedure CheckCursor(const ABytes: TBytes; const AName: string);
+var
+  doc: TBJData;
+  want: string;
+begin
+  doc := TBJData.ParseBytes(ABytes);
+  try
+    want := doc.ToJSON(0);
+  finally
+    doc.Free;
+  end;
+  CheckEq(CursorJSON(TBJData.View(ABytes)), want, 'cursor walk: ' + AName);
+  doc := TBJData.View(ABytes).ToData;
+  try
+    CheckEq(doc.ToJSON(0), want, 'cursor ToData: ' + AName);
+  finally
+    doc.Free;
+  end;
+end;
+
+procedure TestCursor;
+var
+  doc, sub: TBJData;
+  v, rec: TBJValue;
+  it: TBJIterator;
+  bytes: TBytes;
+  n, i: Integer;
+  total: Double;
+  b: TBuf;
+begin
+  WriteLn('lazy cursor');
+
+  doc := TBJData.NewObject;
+  doc.Add('name', TBJData.NewString('probe'));
+  doc.Add('count', TBJData.NewInt(1234));
+  doc.Add('ratio', TBJData.NewFloat(0.25));
+  doc.Add('on', TBJData.NewBool(True));
+  doc.Add('none', TBJData.NewNull);
+  sub := doc.Add('list', TBJData.NewArray);
+  for i := 1 to 5 do
+    sub.Add(TBJData.NewInt(i * 100));
+  sub := doc.Add('deep', TBJData.NewObject);
+  sub.Add('inner', TBJData.NewArray).Add(TBJData.NewString('x'));
+  doc.Add('grid', TBJData.NewTypedArray('D', [2, 3]));
+  doc.Values['grid'].SetElem(5, 2.5);
+  bytes := doc.ToBytes([bjwCount, bjwType]);
+
+  v := TBJData.View(bytes);
+  Check(v.IsValid, 'view is valid');
+  Check(v.Kind = bjkObject, 'view kind');
+  Check(v.Count = 8, 'view child count');
+  Check(v.Find('name').TextEquals('probe'), 'zero-copy key/text comparison');
+  Check(v.Find('count').AsInt64 = 1234, 'view integer');
+  Check(v.Find('ratio').AsDouble = 0.25, 'view float');
+  Check(v.Find('on').AsBoolean, 'view boolean');
+  Check(v.Find('none').IsNull, 'view null');
+  Check(not v.Find('nope').IsValid, 'missing key gives an invalid view');
+  Check(v.Find('list').Count = 5, 'view array count');
+  Check(v.Find('list').Item(3).AsInt64 = 400, 'view array index');
+  Check(v.Path('deep.inner[0]').TextEquals('x'), 'view path lookup');
+  Check(v.Path('list[4]').AsInt64 = 500, 'view path index');
+
+  n := 0;
+  total := 0;
+  for rec in v.Find('list') do
+  begin
+    Inc(n);
+    total := total + rec.AsDouble;
+  end;
+  Check((n = 5) and (total = 1500), 'for..in over an array');
+
+  n := 0;
+  it := v.GetEnumerator;
+  while it.MoveNext do
+  begin
+    Inc(n);
+    if it.KeyEquals('count') then
+      Check(it.Current.AsInt64 = 1234, 'iterator key and value');
+  end;
+  Check(n = 8, 'iterator visited every pair');
+
+  rec := v.Find('grid');
+  Check(rec.IsPacked, 'packed array is recognised');
+  Check(rec.Kind = bjkTypedArray, 'packed array kind');
+  Check(rec.ElemMarker = 'D', 'packed element type');
+  Check(rec.ElementCount = 6, 'packed element count');
+  Check((rec.DimCount = 2) and (rec.Dim(0) = 2) and (rec.Dim(1) = 3),
+    'packed dimensions');
+  Check(rec.ElemAsDouble(5) = 2.5, 'packed element access');
+  Check(rec.DataSize = 48, 'packed payload size');
+  Check(PDouble(rec.DataPtr)[5] = 2.5, 'packed payload is addressed in place');
+  doc.Free;
+
+  CheckCursor(bytes, 'mixed document');
+
+  // the same document in every encoding the writer can produce
+  doc := TBJData.ParseBytes(bytes);
+  try
+    CheckCursor(doc.ToBytes([]), 'unoptimized');
+    CheckCursor(doc.ToBytes([bjwCount]), 'counted');
+    CheckCursor(doc.ToBytes([bjwCount, bjwType]), 'typed');
+    CheckCursor(doc.ToBytes([bjwCount, bjwType, bjwColumnMajor]), 'column-major');
+  finally
+    doc.Free;
+  end;
+
+  // spec constructs: packed N-d arrays, extensions, high precision, char
+  b := TBuf.Create;
+  try
+    b.Hex('5B');
+    b.Hex('5B2455235B2455236903020304');
+    b.Hex('01090600 02090301 08000906 06040207 08050102 03030206');
+    b.Hex('45690869080000404000008040');
+    b.Hex('48690A2D312E3933452B313930');
+    b.Hex('4361');
+    b.Hex('427B');
+    b.Hex('4D0000000000000080');
+    b.Hex('5B2442236904DEADBEEF');
+    b.Hex('5D');
+    CheckCursor(b.Bytes, 'spec constructs');
+  finally
+    b.Free;
+  end;
+
+  // a document holding SoA records next to ordinary values: the cursor has to
+  // know how long an SoA record is in order to reach what follows it
+  b := TBuf.Create;
+  try
+    b.Hex('7B');
+    b.Hex('6905'); b.Txt('first'); b.Hex('6907');
+    b.Hex('6903'); b.Txt('tab'); b.Hex('5B247B');
+    b.Hex('6902'); b.Txt('id'); b.Hex('6D');
+    b.Hex('6906'); b.Txt('status'); b.Hex('5B24532369 03');
+    b.Hex('6906'); b.Txt('active');
+    b.Hex('6908'); b.Txt('inactive');
+    b.Hex('6907'); b.Txt('pending');
+    b.Hex('6904'); b.Txt('name'); b.Hex('5B246C5D');
+    b.Hex('6904'); b.Txt('code'); b.Hex('536904');
+    b.Hex('7D');
+    b.Hex('236903');
+    b.U32(1); b.U8(0); b.U32(0); b.Txt('U001');
+    b.U32(2); b.U8(2); b.U32(1); b.Txt('U002');
+    b.U32(3); b.U8(0); b.U32(2); b.Txt('U003');
+    b.U32(0); b.U32(5); b.U32(8); b.U32(32);
+    b.Txt('AliceBobDr. Christopher Williams');
+    b.Hex('6904'); b.Txt('last'); b.Hex('53690474616B65');
+    b.Hex('7D');
+    bytes := b.Bytes;
+  finally
+    b.Free;
+  end;
+  v := TBJData.View(bytes);
+  Check(v.Find('first').AsInt64 = 7, 'value before an SoA record');
+  Check(v.Find('tab').IsSoA, 'SoA record is recognised');
+  Check(v.Find('last').TextEquals('take'),
+    'the cursor skips over an SoA record to reach the next key');
+  CheckCursor(bytes, 'document containing an SoA record');
+
+  // truncated input must be reported, not walked past
+  n := 0;
+  for i := 1 to Length(bytes) - 1 do
+  begin
+    try
+      CursorJSON(TBJData.View(Copy(bytes, 0, i)));
+    except
+      on E: EBJData do
+        Inc(n);
+      on E: Exception do
+        WriteLn('       unexpected ', E.ClassName, ' at ', i, ': ', E.Message);
+    end;
+  end;
+  Check(n > Length(bytes) div 2,
+    Format('%d truncated prefixes rejected by the cursor', [n]));
+end;
+
 begin
   WriteLn('bjdata.pas ', BJDataVersion, ' test suite');
   WriteLn;
@@ -771,6 +1024,7 @@ begin
   TestRoundTrip;
   TestEdgeCases;
   TestTruncation;
+  TestCursor;
   WriteLn;
   WriteLn(Format('%d test(s), %d failure(s)', [TestCount, FailCount]));
   if FailCount > 0 then

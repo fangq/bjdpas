@@ -30,6 +30,8 @@ unit bjdata;
 
 {$mode objfpc}{$H+}
 {$INLINE ON}
+{$modeswitch advancedrecords}
+{$modeswitch typehelpers}
 
 interface
 
@@ -124,6 +126,95 @@ type
   TBJDataNames = array of string;
   TBJDataDims  = array of Int64;
 
+  { TBJValue - a read-only view of one value inside a buffer.
+
+    Navigating a document through TBJValue allocates nothing: every call
+    decodes straight from the bytes, strings and packed payloads can be read
+    without copying them, and a subtree becomes a TBJData tree only when
+    ToData is called. The buffer must stay alive and unchanged for as long as
+    any view of it is used. }
+
+  TBJValue = record
+  private
+    FPos: PByte;          // the marker of this value, or its payload when
+    FEnd: PByte;          // FImplied is set (elements of a typed container
+    FImplied: AnsiChar;   // carry no marker of their own)
+    function PayloadPtr: PByte; inline;
+    function ContainerBody(out AElem: AnsiChar; out ACount: Int64): PByte;
+  public
+    class function Create(ABuffer: PByte; ASize: PtrUInt): TBJValue; static;
+    class function FromBytes(const ABuffer: TBytes): TBJValue; static;
+
+    function IsValid: Boolean; inline;
+    function Kind: TBJDataKind;
+    function Marker: AnsiChar; inline;
+    function IsNull: Boolean;
+    function IsNumber: Boolean;
+    function IsContainer: Boolean;
+    function IsPacked: Boolean;
+    function IsSoA: Boolean;
+
+    {---- scalars ----}
+    function AsInt64: Int64;
+    function AsQWord: QWord;
+    function AsDouble: Double;
+    function AsBoolean: Boolean;
+    function AsString: string;
+    function TextPtr: PAnsiChar;
+    function TextLength: SizeInt;
+    function TextEquals(const AText: string): Boolean;
+
+    {---- containers ----}
+    function Count: SizeInt;
+    function Item(AIndex: SizeInt): TBJValue;
+    function Find(const AKey: string): TBJValue;
+    function FindKey(AKey: PAnsiChar; ALength: SizeInt): TBJValue;
+    function Path(const APath: string): TBJValue;
+
+    {---- packed arrays ----}
+    function ElemMarker: AnsiChar;
+    function ElementCount: Int64;
+    function DimCount: Integer;
+    function Dim(AIndex: Integer): Int64;
+    function ColumnMajor: Boolean;
+    function DataPtr: Pointer;
+    function DataSize: PtrUInt;
+    function ElemAsInt64(AIndex: Int64): Int64;
+    function ElemAsDouble(AIndex: Int64): Double;
+
+    {---- the value as a whole ----}
+    function Size: PtrUInt;
+    function ToData(AOptions: TBJDataParseOptions = []): TBJData;
+    function ToJSON(AIndent: Integer = 0): string;
+  end;
+
+  { TBJIterator - walks the children of an array or an object; obtained from
+    TBJValue.GetEnumerator, so a container can be used with for..in }
+
+  TBJIterator = record
+  private
+    FNext: PByte;
+    FEnd: PByte;
+    FLeft: Int64;         // remaining children, -1 until an end marker
+    FElem: AnsiChar;      // element type of an optimized container
+    FIsObject: Boolean;
+    FCurrent: TBJValue;
+    FKeyPtr: PByte;
+    FKeyLen: SizeInt;
+  public
+    function MoveNext: Boolean;
+    function Key: string;
+    function KeyPtr: PAnsiChar;
+    function KeyLength: SizeInt;
+    function KeyEquals(const AKey: string): Boolean;
+    property Current: TBJValue read FCurrent;
+  end;
+
+  TBJValueEnumerator = record helper for TBJValue
+  public
+    function GetEnumerator: TBJIterator;
+  end;
+
   { TBJData }
 
   TBJData = class(TObject)
@@ -191,6 +282,9 @@ type
     class function NewComplex(ARe, AIm: Double; ASingle: Boolean = False): TBJData;
     class function NewUUID(const AValue: string): TBJData;
     class function NewDateTime(AValue: TDateTime): TBJData;
+
+    {---- lazy access: creating a view costs nothing ----}
+    class function View(const ABuffer: TBytes): TBJValue;
 
     {---- parsing ----}
     class function Parse(const ABuffer; ALength: PtrUInt;
@@ -277,6 +371,9 @@ function BJUIntMarkerFor(AValue: QWord): AnsiChar;
 function BJHalfToDouble(AValue: Word): Double;
 function BJDoubleToHalf(AValue: Double): Word;
 function BJKindName(AKind: TBJDataKind): string;
+function BJKindOf(AMarker: AnsiChar): TBJDataKind;
+{ the position just past the value starting at APos; raises on malformed input }
+function BJSkipValue(APos, AEnd: PByte): PByte;
 function BJFloatToStr(AValue: Double): string;
 function BJJSONEscape(const AValue: string): string;
 
@@ -614,6 +711,514 @@ begin
     Result[i * 2 + 1] := LowerCase(IntToHex(ABuf[i], 2))[1];
     Result[i * 2 + 2] := LowerCase(IntToHex(ABuf[i], 2))[2];
   end;
+end;
+
+{==============================================================================
+  Buffer walking - shared by the lazy views and by anything that needs to know
+  how long an encoded value is without decoding it
+==============================================================================}
+
+function BJIndexMarkerFor(ACount: Int64): AnsiChar; forward;
+
+function BJKindOf(AMarker: AnsiChar): TBJDataKind;
+begin
+  case AMarker of
+    bjmNull:      Result := bjkNull;
+    bjmNoOp:      Result := bjkNoOp;
+    bjmTrue, bjmFalse:
+                  Result := bjkBoolean;
+    bjmUInt64:    Result := bjkUInt;
+    bjmInt8, bjmUInt8, bjmInt16, bjmUInt16, bjmInt32, bjmUInt32, bjmInt64,
+    bjmByte:      Result := bjkInt;
+    bjmFloat16, bjmFloat32, bjmFloat64:
+                  Result := bjkFloat;
+    bjmString, bjmHighPrec, bjmChar:
+                  Result := bjkString;
+    bjmExtension: Result := bjkExtension;
+    bjmArrayStart:Result := bjkArray;
+    bjmObjectStart:Result := bjkObject;
+  else
+    raise EBJData.CreateFmt('unknown type marker "%s" (0x%.2x)',
+      [AMarker, Ord(AMarker)]);
+  end;
+end;
+
+procedure BJWalkError(const AMsg: string);
+begin
+  raise EBJData.Create(AMsg);
+end;
+
+procedure BJNeed(APos, AEnd: PByte; ACount: PtrUInt); inline;
+begin
+  if APos + ACount > AEnd then
+    BJWalkError('unexpected end of input');
+end;
+
+{ read a value of the given fixed marker at APos and advance }
+function BJWalkInt(var APos: PByte; AEnd: PByte; AMarker: AnsiChar): Int64;
+var
+  n: Integer;
+  v16: Word;
+  v32: LongWord;
+  v64: Int64;
+begin
+  n := BJMarkerSize(AMarker);
+  if n = 0 then
+    BJWalkError(Format('"%s" is not a fixed-length numeric marker', [AMarker]));
+  BJNeed(APos, AEnd, n);
+  case n of
+    1:
+      if AMarker = bjmInt8 then
+        Result := PShortInt(APos)^
+      else
+        Result := APos^;
+    2:
+      begin
+        Move(APos^, v16, 2);
+        BJFromLE(@v16, 2, 1);
+        if AMarker = bjmInt16 then
+          Result := SmallInt(v16)
+        else
+          Result := v16;
+      end;
+    4:
+      begin
+        Move(APos^, v32, 4);
+        BJFromLE(@v32, 4, 1);
+        if AMarker = bjmInt32 then
+          Result := LongInt(v32)
+        else
+          Result := v32;
+      end;
+  else
+    begin
+      Move(APos^, v64, 8);
+      BJFromLE(@v64, 8, 1);
+      Result := v64;
+    end;
+  end;
+  Inc(APos, n);
+end;
+
+{ read a marker plus a non-negative integer }
+function BJWalkSize(var APos: PByte; AEnd: PByte): Int64;
+var
+  m: AnsiChar;
+begin
+  BJNeed(APos, AEnd, 1);
+  m := AnsiChar(APos^);
+  Inc(APos);
+  if not BJIsIntMarker(m) then
+    BJWalkError(Format('"%s" cannot be used as a length or count', [m]));
+  Result := BJWalkInt(APos, AEnd, m);
+  if Result < 0 then
+    BJWalkError('a negative length or count is not allowed');
+end;
+
+{ skip an object key }
+procedure BJWalkKey(var APos: PByte; AEnd: PByte);
+var
+  n: Int64;
+begin
+  n := BJWalkSize(APos, AEnd);
+  BJNeed(APos, AEnd, n);
+  Inc(APos, n);
+end;
+
+{ the dimension vector after a '#'; returns the element count and, when ADims
+  is given, the individual dimensions }
+function BJWalkCount(var APos: PByte; AEnd: PByte; ADims: TBJDataDims;
+  out ANDim: Integer; out AColumnMajor: Boolean): Int64;
+var
+  m, et: AnsiChar;
+  k, i, v: Int64;
+
+  procedure Push(AValue: Int64);
+  begin
+    if (ADims <> nil) and (ANDim < Length(ADims)) then
+      ADims[ANDim] := AValue;
+    Inc(ANDim);
+  end;
+
+  function ReadVector: Int64;
+  var
+    i: Int64;
+  begin
+    Result := 1;
+    BJNeed(APos, AEnd, 1);
+    m := AnsiChar(APos^);
+    if m = bjmArrayStart then                  // [[dims]] : column-major
+    begin
+      Inc(APos);
+      AColumnMajor := True;
+      Result := ReadVector;
+      BJNeed(APos, AEnd, 1);
+      if AnsiChar(APos^) = bjmArrayEnd then
+        Inc(APos);
+      Exit;
+    end;
+    if m = bjmCountMark then
+    begin
+      Inc(APos);
+      k := BJWalkSize(APos, AEnd);
+      BJNeed(APos, AEnd, 1);
+      if AnsiChar(APos^) = bjmArrayStart then  // [#1 [dims] : column-major
+      begin
+        Inc(APos);
+        AColumnMajor := True;
+        Exit(ReadVector);
+      end;
+      for i := 1 to k do
+      begin
+        v := BJWalkSize(APos, AEnd);
+        Push(v);
+        Result := Result * v;
+      end;
+      Exit;
+    end;
+    if m = bjmTypeMark then                    // [$t#n dims...
+    begin
+      Inc(APos);
+      BJNeed(APos, AEnd, 1);
+      et := AnsiChar(APos^);
+      Inc(APos);
+      BJNeed(APos, AEnd, 1);
+      if AnsiChar(APos^) <> bjmCountMark then
+        BJWalkError('a dimension vector needs a count');
+      Inc(APos);
+      k := BJWalkSize(APos, AEnd);
+      for i := 1 to k do
+      begin
+        v := BJWalkInt(APos, AEnd, et);
+        Push(v);
+        Result := Result * v;
+      end;
+      Exit;
+    end;
+    while True do                              // [dim dim ... ]
+    begin
+      BJNeed(APos, AEnd, 1);
+      m := AnsiChar(APos^);
+      if m = bjmArrayEnd then
+      begin
+        Inc(APos);
+        Break;
+      end;
+      v := BJWalkSize(APos, AEnd);
+      Push(v);
+      Result := Result * v;
+    end;
+  end;
+
+begin
+  ANDim := 0;
+  AColumnMajor := False;
+  BJNeed(APos, AEnd, 1);
+  m := AnsiChar(APos^);
+  Inc(APos);
+  if m = bjmArrayStart then
+    Result := ReadVector
+  else
+  begin
+    if not BJIsIntMarker(m) then
+      BJWalkError(Format('"%s" cannot be used as a container count', [m]));
+    Result := BJWalkInt(APos, AEnd, m);
+    if Result < 0 then
+      BJWalkError('a negative container count is not allowed');
+    Push(Result);
+  end;
+end;
+
+{ skip the payload of a value whose type is fixed by the container header }
+procedure BJWalkTyped(var APos: PByte; AEnd: PByte; AMarker: AnsiChar);
+var
+  n: Int64;
+begin
+  case AMarker of
+    bjmNull, bjmNoOp, bjmTrue, bjmFalse:
+      ;
+    bjmString, bjmHighPrec:
+      begin
+        n := BJWalkSize(APos, AEnd);
+        BJNeed(APos, AEnd, n);
+        Inc(APos, n);
+      end;
+  else
+    n := BJMarkerSize(AMarker);
+    if n = 0 then
+      BJWalkError(Format('"%s" cannot be a container element type', [AMarker]));
+    BJNeed(APos, AEnd, n);
+    Inc(APos, n);
+  end;
+end;
+
+{ measure one SoA schema field, adding its payload width to ASize and
+  appending the index type of every offset column to AOffsets }
+procedure BJWalkSchemaField(var APos: PByte; AEnd: PByte; var ASize: Int64;
+  var AOffsets: string);
+var
+  m, t: AnsiChar;
+  n, i: Int64;
+begin
+  BJNeed(APos, AEnd, 1);
+  m := AnsiChar(APos^);
+  Inc(APos);
+  case m of
+    bjmArrayStart:
+      begin
+        BJNeed(APos, AEnd, 1);
+        if AnsiChar(APos^) = bjmTypeMark then
+        begin
+          Inc(APos);
+          BJNeed(APos, AEnd, 1);
+          t := AnsiChar(APos^);
+          Inc(APos);
+          if (t = bjmString) or (t = bjmHighPrec) then
+          begin                                // dictionary column
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) <> bjmCountMark then
+              BJWalkError('a dictionary column needs a count');
+            Inc(APos);
+            n := BJWalkSize(APos, AEnd);
+            for i := 1 to n do
+              BJWalkKey(APos, AEnd);
+            ASize := ASize + BJMarkerSize(BJIndexMarkerFor(n));
+          end
+          else
+          begin                                // offset table column
+            if BJMarkerSize(t) = 0 then
+              BJWalkError('an offset column needs an integer type');
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) <> bjmArrayEnd then
+              BJWalkError('an offset column needs a closing bracket');
+            Inc(APos);
+            ASize := ASize + BJMarkerSize(t);
+            AOffsets := AOffsets + t;
+          end;
+        end
+        else
+          while True do                        // fixed array column
+          begin
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) = bjmArrayEnd then
+            begin
+              Inc(APos);
+              Break;
+            end;
+            BJWalkSchemaField(APos, AEnd, ASize, AOffsets);
+          end;
+      end;
+    bjmObjectStart:
+      while True do                            // nested record
+      begin
+        BJNeed(APos, AEnd, 1);
+        if AnsiChar(APos^) = bjmObjectEnd then
+        begin
+          Inc(APos);
+          Break;
+        end;
+        BJWalkKey(APos, AEnd);
+        BJWalkSchemaField(APos, AEnd, ASize, AOffsets);
+      end;
+    bjmString, bjmHighPrec:
+      ASize := ASize + BJWalkSize(APos, AEnd);
+    bjmTrue:
+      ASize := ASize + 1;
+    bjmNull:
+      ;
+  else
+    if BJMarkerSize(m) = 0 then
+      BJWalkError(Format('"%s" is not a valid SoA schema type', [m]));
+    ASize := ASize + BJMarkerSize(m);
+  end;
+end;
+
+// skip a structure-of-arrays record; APos is just past the schema opener
+procedure BJWalkSoA(var APos: PByte; AEnd: PByte);
+var
+  recsize, count, n: Int64;
+  offsets: string;
+  ndim, i, k: Integer;
+  colmajor: Boolean;
+  last: Int64;
+begin
+  recsize := 0;
+  offsets := '';
+  while True do
+  begin
+    BJNeed(APos, AEnd, 1);
+    if AnsiChar(APos^) = bjmObjectEnd then
+    begin
+      Inc(APos);
+      Break;
+    end;
+    if AnsiChar(APos^) = bjmNoOp then
+    begin
+      Inc(APos);
+      Continue;
+    end;
+    BJWalkKey(APos, AEnd);
+    BJWalkSchemaField(APos, AEnd, recsize, offsets);
+  end;
+  BJNeed(APos, AEnd, 1);
+  if AnsiChar(APos^) <> bjmCountMark then
+    BJWalkError('an SoA record needs a count');
+  Inc(APos);
+  count := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
+  n := count * recsize;
+  BJNeed(APos, AEnd, n);
+  Inc(APos, n);
+  { each offset column appends its own table and string buffer }
+  for k := 1 to Length(offsets) do
+  begin
+    last := 0;
+    for i := 0 to count do
+      last := BJWalkInt(APos, AEnd, offsets[k]);
+    BJNeed(APos, AEnd, last);
+    Inc(APos, last);
+  end;
+end;
+
+function BJSkipValue(APos, AEnd: PByte): PByte;
+var
+  m, et: AnsiChar;
+  n, i, cnt: Int64;
+  ndim: Integer;
+  colmajor: Boolean;
+begin
+  BJNeed(APos, AEnd, 1);
+  m := AnsiChar(APos^);
+  Inc(APos);
+  case m of
+    bjmNull, bjmNoOp, bjmTrue, bjmFalse:
+      ;
+    bjmInt8, bjmUInt8, bjmInt16, bjmUInt16, bjmInt32, bjmUInt32, bjmInt64,
+    bjmUInt64, bjmFloat16, bjmFloat32, bjmFloat64, bjmChar, bjmByte:
+      begin
+        n := BJMarkerSize(m);
+        BJNeed(APos, AEnd, n);
+        Inc(APos, n);
+      end;
+    bjmString, bjmHighPrec:
+      begin
+        n := BJWalkSize(APos, AEnd);
+        BJNeed(APos, AEnd, n);
+        Inc(APos, n);
+      end;
+    bjmExtension:
+      begin
+        BJWalkSize(APos, AEnd);
+        n := BJWalkSize(APos, AEnd);
+        BJNeed(APos, AEnd, n);
+        Inc(APos, n);
+      end;
+    bjmArrayStart:
+      begin
+        BJNeed(APos, AEnd, 1);
+        et := AnsiChar(APos^);
+        if et = bjmTypeMark then
+        begin
+          Inc(APos);
+          BJNeed(APos, AEnd, 1);
+          et := AnsiChar(APos^);
+          Inc(APos);
+          if et = bjmObjectStart then
+            BJWalkSoA(APos, AEnd)
+          else
+          begin
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) <> bjmCountMark then
+              BJWalkError('a typed array needs a count');
+            Inc(APos);
+            cnt := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
+            if BJIsFixedMarker(et) then
+            begin
+              n := cnt * BJMarkerSize(et);
+              BJNeed(APos, AEnd, n);
+              Inc(APos, n);
+            end
+            else
+              for i := 1 to cnt do
+                BJWalkTyped(APos, AEnd, et);
+          end;
+        end
+        else if et = bjmCountMark then
+        begin
+          Inc(APos);
+          cnt := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
+          for i := 1 to cnt do
+            APos := BJSkipValue(APos, AEnd);
+        end
+        else
+          while True do
+          begin
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) = bjmArrayEnd then
+            begin
+              Inc(APos);
+              Break;
+            end;
+            APos := BJSkipValue(APos, AEnd);
+          end;
+      end;
+    bjmObjectStart:
+      begin
+        BJNeed(APos, AEnd, 1);
+        et := AnsiChar(APos^);
+        if et = bjmTypeMark then
+        begin
+          Inc(APos);
+          BJNeed(APos, AEnd, 1);
+          et := AnsiChar(APos^);
+          Inc(APos);
+          if et = bjmObjectStart then
+            BJWalkSoA(APos, AEnd)
+          else
+          begin
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) <> bjmCountMark then
+              BJWalkError('a typed object needs a count');
+            Inc(APos);
+            cnt := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
+            for i := 1 to cnt do
+            begin
+              BJWalkKey(APos, AEnd);
+              BJWalkTyped(APos, AEnd, et);
+            end;
+          end;
+        end
+        else if et = bjmCountMark then
+        begin
+          Inc(APos);
+          cnt := BJWalkCount(APos, AEnd, nil, ndim, colmajor);
+          for i := 1 to cnt do
+          begin
+            BJWalkKey(APos, AEnd);
+            APos := BJSkipValue(APos, AEnd);
+          end;
+        end
+        else
+          while True do
+          begin
+            BJNeed(APos, AEnd, 1);
+            if AnsiChar(APos^) = bjmObjectEnd then
+            begin
+              Inc(APos);
+              Break;
+            end;
+            if AnsiChar(APos^) = bjmNoOp then
+            begin
+              Inc(APos);
+              Continue;
+            end;
+            BJWalkKey(APos, AEnd);
+            APos := BJSkipValue(APos, AEnd);
+          end;
+      end;
+  else
+    BJWalkError(Format('unknown type marker "%s" (0x%.2x)', [m, Ord(m)]));
+  end;
+  Result := APos;
 end;
 
 {==============================================================================
@@ -3997,6 +4602,733 @@ begin
   finally
     BJFreeSchema(schema);
   end;
+end;
+
+{==============================================================================
+  TBJValue / TBJIterator - lazy views over a buffer
+==============================================================================}
+
+const
+  BJMaxViewDims = 16;
+
+function TBJValue.PayloadPtr: PByte;
+begin
+  if FImplied <> #0 then
+    Result := FPos
+  else
+    Result := FPos + 1;
+end;
+
+{ position of the first child, with the element type and the promised child
+  count of an optimized container (-1 when the container ends with a marker) }
+function TBJValue.ContainerBody(out AElem: AnsiChar; out ACount: Int64): PByte;
+var
+  p: PByte;
+  m: AnsiChar;
+  ndim: Integer;
+  colmajor: Boolean;
+begin
+  AElem := #0;
+  ACount := -1;
+  m := Marker;
+  if (m <> bjmArrayStart) and (m <> bjmObjectStart) then
+    raise EBJData.CreateFmt('a %s is not a container', [BJKindName(Kind)]);
+  p := FPos + 1;
+  BJNeed(p, FEnd, 1);
+  if AnsiChar(p^) = bjmTypeMark then
+  begin
+    Inc(p);
+    BJNeed(p, FEnd, 1);
+    AElem := AnsiChar(p^);
+    Inc(p);
+    if AElem = bjmObjectStart then
+      raise EBJData.Create('a structure-of-arrays record cannot be browsed ' +
+        'element by element, use ToData');
+    BJNeed(p, FEnd, 1);
+    if AnsiChar(p^) <> bjmCountMark then
+      BJWalkError('an optimized container needs a count');
+    Inc(p);
+    ACount := BJWalkCount(p, FEnd, nil, ndim, colmajor);
+  end
+  else if AnsiChar(p^) = bjmCountMark then
+  begin
+    Inc(p);
+    ACount := BJWalkCount(p, FEnd, nil, ndim, colmajor);
+  end;
+  Result := p;
+end;
+
+class function TBJValue.Create(ABuffer: PByte; ASize: PtrUInt): TBJValue;
+begin
+  Result.FPos := ABuffer;
+  Result.FEnd := ABuffer + ASize;
+  Result.FImplied := #0;
+  while (Result.FPos < Result.FEnd) and (AnsiChar(Result.FPos^) = bjmNoOp) do
+    Inc(Result.FPos);
+end;
+
+class function TBJValue.FromBytes(const ABuffer: TBytes): TBJValue;
+begin
+  if Length(ABuffer) = 0 then
+    raise EBJData.Create('cannot view an empty buffer');
+  Result := TBJValue.Create(@ABuffer[0], Length(ABuffer));
+end;
+
+function TBJValue.IsValid: Boolean;
+begin
+  Result := (FPos <> nil) and (FPos < FEnd);
+end;
+
+function TBJValue.Marker: AnsiChar;
+begin
+  if FImplied <> #0 then
+    Result := FImplied
+  else
+  begin
+    if not IsValid then
+      raise EBJData.Create('this view does not point at a value');
+    Result := AnsiChar(FPos^);
+  end;
+end;
+
+function TBJValue.Kind: TBJDataKind;
+begin
+  if IsPacked then
+    Result := bjkTypedArray
+  else
+    Result := BJKindOf(Marker);
+end;
+
+function TBJValue.IsNull: Boolean;
+begin
+  Result := IsValid and (Marker = bjmNull);
+end;
+
+function TBJValue.IsNumber: Boolean;
+begin
+  Result := IsValid and (BJKindOf(Marker) in [bjkInt, bjkUInt, bjkFloat]);
+end;
+
+function TBJValue.IsContainer: Boolean;
+begin
+  Result := IsValid and (FImplied = #0) and
+            (AnsiChar(FPos^) in [bjmArrayStart, bjmObjectStart]);
+end;
+
+function TBJValue.IsPacked: Boolean;
+begin
+  Result := False;
+  if (FImplied <> #0) or not IsValid or (AnsiChar(FPos^) <> bjmArrayStart) then
+    Exit;
+  if (FPos + 2 < FEnd) and (AnsiChar((FPos + 1)^) = bjmTypeMark) then
+    Result := BJIsFixedMarker(AnsiChar((FPos + 2)^));
+end;
+
+function TBJValue.IsSoA: Boolean;
+begin
+  Result := False;
+  if (FImplied <> #0) or not IsValid then
+    Exit;
+  if not (AnsiChar(FPos^) in [bjmArrayStart, bjmObjectStart]) then
+    Exit;
+  if (FPos + 2 < FEnd) and (AnsiChar((FPos + 1)^) = bjmTypeMark) then
+    Result := AnsiChar((FPos + 2)^) = bjmObjectStart;
+end;
+
+function TBJValue.AsInt64: Int64;
+var
+  m: AnsiChar;
+  p: PByte;
+begin
+  m := Marker;
+  p := PayloadPtr;
+  case m of
+    bjmTrue:
+      Result := 1;
+    bjmFalse, bjmNull, bjmNoOp:
+      Result := 0;
+    bjmChar:
+      Result := p^;
+    bjmString, bjmHighPrec:
+      Result := StrToInt64Def(Trim(AsString), 0);
+    bjmFloat16, bjmFloat32, bjmFloat64:
+      Result := Round(AsDouble);
+  else
+    Result := BJWalkInt(p, FEnd, m);
+  end;
+end;
+
+function TBJValue.AsQWord: QWord;
+begin
+  Result := QWord(AsInt64);
+end;
+
+function TBJValue.AsDouble: Double;
+var
+  m: AnsiChar;
+  p: PByte;
+  w: Word;
+  f: Single;
+  d: Double;
+begin
+  m := Marker;
+  p := PayloadPtr;
+  case m of
+    bjmFloat16:
+      begin
+        BJNeed(p, FEnd, 2);
+        Move(p^, w, 2);
+        BJFromLE(@w, 2, 1);
+        Result := BJHalfToDouble(w);
+      end;
+    bjmFloat32:
+      begin
+        BJNeed(p, FEnd, 4);
+        Move(p^, f, 4);
+        BJFromLE(@f, 4, 1);
+        Result := f;
+      end;
+    bjmFloat64:
+      begin
+        BJNeed(p, FEnd, 8);
+        Move(p^, d, 8);
+        BJFromLE(@d, 8, 1);
+        Result := d;
+      end;
+    bjmUInt64:
+      Result := QWord(BJWalkInt(p, FEnd, m));
+    bjmString, bjmHighPrec:
+      Result := StrToFloatDef(Trim(AsString), 0.0, BJFormat);
+  else
+    Result := AsInt64;
+  end;
+end;
+
+function TBJValue.AsBoolean: Boolean;
+var
+  m: AnsiChar;
+begin
+  m := Marker;
+  case m of
+    bjmTrue:
+      Result := True;
+    bjmFalse, bjmNull, bjmNoOp:
+      Result := False;
+    bjmString, bjmHighPrec:
+      Result := (TextLength > 0) and (LowerCase(AsString) <> 'false');
+    bjmChar:
+      Result := True;
+    bjmFloat16, bjmFloat32, bjmFloat64:
+      Result := AsDouble <> 0;
+  else
+    Result := AsInt64 <> 0;
+  end;
+end;
+
+function TBJValue.TextLength: SizeInt;
+var
+  m: AnsiChar;
+  p: PByte;
+begin
+  m := Marker;
+  if m = bjmChar then
+    Exit(1);
+  if (m <> bjmString) and (m <> bjmHighPrec) then
+    Exit(0);
+  p := PayloadPtr;
+  Result := BJWalkSize(p, FEnd);
+end;
+
+function TBJValue.TextPtr: PAnsiChar;
+var
+  m: AnsiChar;
+  p: PByte;
+begin
+  m := Marker;
+  p := PayloadPtr;
+  if (m = bjmString) or (m = bjmHighPrec) then
+    BJWalkSize(p, FEnd)
+  else if m <> bjmChar then
+    Exit(nil);
+  Result := PAnsiChar(p);
+end;
+
+function TBJValue.TextEquals(const AText: string): Boolean;
+var
+  m: AnsiChar;
+  p: PByte;
+  n: SizeInt;
+begin
+  Result := False;
+  m := Marker;
+  p := PayloadPtr;
+  if (m = bjmString) or (m = bjmHighPrec) then
+    n := BJWalkSize(p, FEnd)
+  else if m = bjmChar then
+    n := 1
+  else
+    Exit;
+  if n <> Length(AText) then
+    Exit;
+  Result := (n = 0) or CompareMem(p, PAnsiChar(AText), n);
+end;
+
+function TBJValue.AsString: string;
+var
+  m: AnsiChar;
+  p: PByte;
+  n: SizeInt;
+begin
+  m := Marker;
+  p := PayloadPtr;
+  case m of
+    bjmString, bjmHighPrec:
+      begin
+        n := BJWalkSize(p, FEnd);
+        BJNeed(p, FEnd, n);
+        SetString(Result, PAnsiChar(p), n);
+      end;
+    bjmChar:
+      begin
+        BJNeed(p, FEnd, 1);
+        Result := AnsiChar(p^);
+      end;
+    bjmTrue:
+      Result := 'true';
+    bjmFalse:
+      Result := 'false';
+    bjmNull:
+      Result := 'null';
+    bjmNoOp:
+      Result := '';
+    bjmFloat16, bjmFloat32, bjmFloat64:
+      Result := BJFloatToStr(AsDouble);
+    bjmUInt64:
+      Result := UIntToStr(AsQWord);
+    bjmArrayStart, bjmObjectStart:
+      Result := ToJSON(0);
+  else
+    Result := IntToStr(AsInt64);
+  end;
+end;
+
+function TBJValue.Size: PtrUInt;
+var
+  p: PByte;
+begin
+  if FImplied <> #0 then
+  begin
+    p := FPos;
+    BJWalkTyped(p, FEnd, FImplied);
+    Result := p - FPos;
+  end
+  else
+    Result := BJSkipValue(FPos, FEnd) - FPos;
+end;
+
+function TBJValueEnumerator.GetEnumerator: TBJIterator;
+begin
+  Result.FNext := Self.ContainerBody(Result.FElem, Result.FLeft);
+  Result.FEnd := Self.FEnd;
+  Result.FIsObject := Self.Marker = bjmObjectStart;
+  Result.FKeyPtr := nil;
+  Result.FKeyLen := 0;
+  Result.FCurrent.FPos := nil;
+  Result.FCurrent.FEnd := Self.FEnd;
+  Result.FCurrent.FImplied := #0;
+end;
+
+function TBJIterator.MoveNext: Boolean;
+begin
+  Result := False;
+  if (FLeft = 0) or (FNext = nil) then
+    Exit;
+  if FLeft < 0 then
+  begin
+    while (FNext < FEnd) and (AnsiChar(FNext^) = bjmNoOp) do
+      Inc(FNext);
+    if FNext >= FEnd then
+      Exit;
+    if FIsObject then
+    begin
+      if AnsiChar(FNext^) = bjmObjectEnd then
+      begin
+        Inc(FNext);
+        FLeft := 0;
+        Exit;
+      end;
+    end
+    else if AnsiChar(FNext^) = bjmArrayEnd then
+    begin
+      Inc(FNext);
+      FLeft := 0;
+      Exit;
+    end;
+  end
+  else if FNext >= FEnd then
+    Exit;
+  if FIsObject then
+  begin
+    FKeyLen := BJWalkSize(FNext, FEnd);
+    BJNeed(FNext, FEnd, FKeyLen);
+    FKeyPtr := FNext;
+    Inc(FNext, FKeyLen);
+  end;
+  FCurrent.FPos := FNext;
+  if FElem <> #0 then
+  begin
+    FCurrent.FImplied := FElem;
+    BJWalkTyped(FNext, FEnd, FElem);
+  end
+  else
+  begin
+    FCurrent.FImplied := #0;
+    FNext := BJSkipValue(FNext, FEnd);
+  end;
+  if FLeft > 0 then
+    Dec(FLeft);
+  Result := True;
+end;
+
+function TBJIterator.Key: string;
+begin
+  SetString(Result, PAnsiChar(FKeyPtr), FKeyLen);
+end;
+
+function TBJIterator.KeyPtr: PAnsiChar;
+begin
+  Result := PAnsiChar(FKeyPtr);
+end;
+
+function TBJIterator.KeyLength: SizeInt;
+begin
+  Result := FKeyLen;
+end;
+
+function TBJIterator.KeyEquals(const AKey: string): Boolean;
+begin
+  Result := (FKeyLen = Length(AKey)) and
+            ((FKeyLen = 0) or CompareMem(FKeyPtr, PAnsiChar(AKey), FKeyLen));
+end;
+
+function TBJValue.Count: SizeInt;
+var
+  elem: AnsiChar;
+  n: Int64;
+  it: TBJIterator;
+begin
+  if IsPacked then
+    Exit(ElementCount);
+  ContainerBody(elem, n);
+  if n >= 0 then
+    Exit(n);
+  Result := 0;
+  it := Self.GetEnumerator;
+  while it.MoveNext do
+    Inc(Result);
+end;
+
+function TBJValue.Item(AIndex: SizeInt): TBJValue;
+var
+  elem: AnsiChar;
+  n: Int64;
+  body: PByte;
+  i: SizeInt;
+  it: TBJIterator;
+begin
+  Result.FPos := nil;
+  Result.FEnd := FEnd;
+  Result.FImplied := #0;
+  if AIndex < 0 then
+    Exit;
+  body := ContainerBody(elem, n);
+  if (n >= 0) and (AIndex >= n) then
+    Exit;
+  if (elem <> #0) and BJIsFixedMarker(elem) then
+  begin                                        { packed: constant time }
+    Result.FPos := body + AIndex * BJMarkerSize(elem);
+    Result.FImplied := elem;
+    if Result.FPos >= FEnd then
+      Result.FPos := nil;
+    Exit;
+  end;
+  i := 0;
+  it := Self.GetEnumerator;
+  while it.MoveNext do
+  begin
+    if i = AIndex then
+      Exit(it.Current);
+    Inc(i);
+  end;
+end;
+
+function TBJValue.Find(const AKey: string): TBJValue;
+begin
+  Result := FindKey(PAnsiChar(AKey), Length(AKey));
+end;
+
+{ look a key up without needing it as a string, so that a path can be walked
+  without allocating one token per segment }
+function TBJValue.FindKey(AKey: PAnsiChar; ALength: SizeInt): TBJValue;
+var
+  it: TBJIterator;
+begin
+  Result.FPos := nil;
+  Result.FEnd := FEnd;
+  Result.FImplied := #0;
+  if not IsValid or (FImplied <> #0) or (AnsiChar(FPos^) <> bjmObjectStart) then
+    Exit;
+  it := Self.GetEnumerator;
+  while it.MoveNext do
+    if (it.FKeyLen = ALength) and
+       ((ALength = 0) or CompareMem(it.FKeyPtr, AKey, ALength)) then
+      Exit(it.Current);
+end;
+
+function TBJValue.Path(const APath: string): TBJValue;
+var
+  i, len, start: Integer;
+  idx: Int64;
+  node: TBJValue;
+  base: PAnsiChar;
+begin
+  node := Self;
+  base := PAnsiChar(APath);
+  i := 1;
+  len := Length(APath);
+  start := 1;
+  while (i <= len) and node.IsValid do
+  begin
+    case APath[i] of
+      '.':
+        begin
+          if i > start then
+            node := node.FindKey(base + start - 1, i - start);
+          Inc(i);
+          start := i;
+        end;
+      '[':
+        begin
+          if i > start then
+            node := node.FindKey(base + start - 1, i - start);
+          Inc(i);
+          idx := 0;
+          while (i <= len) and (APath[i] <> ']') do
+          begin
+            if (APath[i] >= '0') and (APath[i] <= '9') then
+              idx := idx * 10 + (Ord(APath[i]) - Ord('0'))
+            else
+              idx := -1;
+            Inc(i);
+          end;
+          if i <= len then
+            Inc(i);
+          start := i;
+          if node.IsValid then
+            node := node.Item(idx);
+        end;
+    else
+      Inc(i);
+    end;
+  end;
+  if node.IsValid and (len >= start) then
+    node := node.FindKey(base + start - 1, len - start + 1);
+  Result := node;
+end;
+
+function TBJValue.ElemMarker: AnsiChar;
+var
+  n: Int64;
+begin
+  ContainerBody(Result, n);
+end;
+
+function TBJValue.ElementCount: Int64;
+var
+  elem: AnsiChar;
+begin
+  ContainerBody(elem, Result);
+  if Result < 0 then
+    Result := Count;
+end;
+
+function TBJValue.DimCount: Integer;
+var
+  dims: TBJDataDims;
+  colmajor: Boolean;
+  p: PByte;
+  elem: AnsiChar;
+begin
+  Result := 0;
+  if not IsContainer then
+    Exit;
+  p := FPos + 1;
+  BJNeed(p, FEnd, 1);
+  if AnsiChar(p^) = bjmTypeMark then
+  begin
+    Inc(p);
+    elem := AnsiChar(p^);
+    Inc(p);
+    if elem = bjmObjectStart then
+      Exit;
+    Inc(p);                                    { the '#' }
+  end
+  else if AnsiChar(p^) = bjmCountMark then
+    Inc(p)
+  else
+    Exit;
+  SetLength(dims, BJMaxViewDims);
+  BJWalkCount(p, FEnd, dims, Result, colmajor);
+end;
+
+function TBJValue.Dim(AIndex: Integer): Int64;
+var
+  dims: TBJDataDims;
+  colmajor: Boolean;
+  p: PByte;
+  elem: AnsiChar;
+  ndim: Integer;
+begin
+  Result := 0;
+  if not IsContainer then
+    Exit;
+  p := FPos + 1;
+  BJNeed(p, FEnd, 1);
+  if AnsiChar(p^) = bjmTypeMark then
+  begin
+    Inc(p);
+    elem := AnsiChar(p^);
+    Inc(p);
+    if elem = bjmObjectStart then
+      Exit;
+    Inc(p);
+  end
+  else if AnsiChar(p^) = bjmCountMark then
+    Inc(p)
+  else
+    Exit;
+  SetLength(dims, BJMaxViewDims);
+  BJWalkCount(p, FEnd, dims, ndim, colmajor);
+  if (AIndex >= 0) and (AIndex < ndim) and (AIndex < BJMaxViewDims) then
+    Result := dims[AIndex];
+end;
+
+function TBJValue.ColumnMajor: Boolean;
+var
+  dims: TBJDataDims;
+  p: PByte;
+  elem: AnsiChar;
+  ndim: Integer;
+begin
+  Result := False;
+  if not IsContainer then
+    Exit;
+  p := FPos + 1;
+  BJNeed(p, FEnd, 1);
+  if AnsiChar(p^) = bjmTypeMark then
+  begin
+    Inc(p);
+    elem := AnsiChar(p^);
+    Inc(p);
+    if elem = bjmObjectStart then
+      Exit;
+    Inc(p);
+  end
+  else if AnsiChar(p^) = bjmCountMark then
+    Inc(p)
+  else
+    Exit;
+  SetLength(dims, BJMaxViewDims);
+  BJWalkCount(p, FEnd, dims, ndim, Result);
+end;
+
+{ the packed payload, in the little-endian order of the file }
+function TBJValue.DataPtr: Pointer;
+var
+  elem: AnsiChar;
+  n: Int64;
+begin
+  Result := ContainerBody(elem, n);
+  if (elem = #0) or not BJIsFixedMarker(elem) then
+    Result := nil;
+end;
+
+function TBJValue.DataSize: PtrUInt;
+var
+  elem: AnsiChar;
+  n: Int64;
+begin
+  Result := 0;
+  ContainerBody(elem, n);
+  if (elem <> #0) and BJIsFixedMarker(elem) and (n > 0) then
+    Result := n * BJMarkerSize(elem);
+end;
+
+function TBJValue.ElemAsInt64(AIndex: Int64): Int64;
+begin
+  Result := Item(AIndex).AsInt64;
+end;
+
+function TBJValue.ElemAsDouble(AIndex: Int64): Double;
+begin
+  Result := Item(AIndex).AsDouble;
+end;
+
+function TBJValue.ToData(AOptions: TBJDataParseOptions): TBJData;
+var
+  rd: TBJReader;
+  p: PByte;
+begin
+  if not IsValid then
+    raise EBJData.Create('this view does not point at a value');
+  if FImplied <> #0 then
+  begin                                        { an element of a typed array }
+    p := FPos;
+    if BJIsFloatMarker(FImplied) then
+      Result := TBJData.NewFloat(AsDouble, FImplied)
+    else if FImplied = bjmChar then
+      Result := TBJData.NewChar(AnsiChar(p^))
+    else if BJIsFixedMarker(FImplied) then
+      Result := TBJData.NewInt(AsInt64, FImplied)
+    else
+    begin
+      rd := TBJReader.Create(FPos, FEnd - FPos, AOptions);
+      try
+        Result := rd.ReadScalar(FImplied);
+      finally
+        rd.Free;
+      end;
+    end;
+    Exit;
+  end;
+  rd := TBJReader.Create(FPos, FEnd - FPos, AOptions);
+  try
+    try
+      Result := rd.ReadValue;
+    except
+      rd.FreePending;
+      raise;
+    end;
+  finally
+    rd.Free;
+  end;
+end;
+
+function TBJValue.ToJSON(AIndent: Integer): string;
+var
+  doc: TBJData;
+begin
+  doc := ToData;
+  try
+    Result := doc.ToJSON(AIndent);
+  finally
+    doc.Free;
+  end;
+end;
+
+class function TBJData.View(const ABuffer: TBytes): TBJValue;
+begin
+  Result := TBJValue.FromBytes(ABuffer);
 end;
 
 {==============================================================================
