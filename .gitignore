@@ -8,6 +8,6 @@
 backup/
 lib/
 build/
-pascal/test/bjdtest
-pascal/tools/bjd2json
-pascal/bjdatapkg.pas
+src/test/bjdtest
+src/tools/bjd2json
+src/bjdatapkg.pas
